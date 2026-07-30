@@ -140,6 +140,14 @@ function ffeeEx(p){ return Math.max(fee(p)-pfeeEx(p),0); }
 function adjFee(p){ const f=Number(p.adj); return isFinite(f)?f:0; }
 function money(x){ return "$"+Math.round(x).toLocaleString("en-AU"); }
 function money2(x){ return "$"+x.toLocaleString("en-AU",{minimumFractionDigits:2,maximumFractionDigits:2}); }
+function projHours(p){ return (p.log||[]).reduce((a,e)=>a+(Number(e.h)||0),0); }
+function projPaid(p){ let v=0; for(const e of (p.log||[])){ if(e.st==="PAIDP") v+=pfeeEx(p); if(e.st==="PAIDF") v+=ffeeEx(p); } return v; }
+function rateOf(v,h){ return h>0? v/h : null; }
+function rateTxt(v,h){ const r=rateOf(v,h); return r==null? "—" : money(r)+"/hr"; }
+function hTxt(h){ return h? String(Number(h.toFixed(2))) : "—"; }
+function fyHours(){ const a=fyStartISO(), b=fyEndISO(); let h=0;
+  for(const p of T.projects) for(const e of (p.log||[])) if(e.d>=a&&e.d<=b) h+=Number(e.h)||0;
+  return h; }
 function lastEvent(p,ids){ const l=sortedLog(p).filter(e=>ids.includes(e.st)); return l.length?l[l.length-1]:null; }
 function hasAccepted(p){ return p.log.some(e=>["ACC","INVP","PAIDP","INVF","PAIDF","DONE","ADJ"].includes(e.st)); }
 
@@ -319,6 +327,14 @@ function pageData(){
     +(a?'<div class="fee-line"><span>Adjustment invoice (incl GST)</span><b>'+money2(a*(1+GST))+'<span style="color:var(--muted);font-weight:400"> ('+money2(a)+' ex)</span></b></div>':'')
     +'</div></div></section>';
 
+  const hrs=projHours(p), paidNow=projPaid(p), totFee=fee(p)+adjFee(p);
+  const nTimed=(p.log||[]).filter(e=>Number(e.h)>0).length;
+  h+='<section class="card"><div class="sec-head"><h2>Time &amp; hourly rate</h2><span style="font-size:11px;color:var(--muted)">from hours logged against each status entry</span></div><div class="sec-body">'
+    +'<div class="statbox"><div class="lbl">Hours logged</div><div class="val">'+hTxt(hrs)+'</div><div class="sub">'+nTimed+' entr'+(nTimed===1?"y":"ies")+' with time recorded</div></div>'
+    +'<div class="statbox"><div class="lbl">Rate at full fee</div><div class="val">'+rateTxt(totFee,hrs)+'</div><div class="sub">'+money(totFee)+' ex GST ÷ hours logged</div></div>'
+    +'<div class="statbox"><div class="lbl">Rate on money received</div><div class="val">'+rateTxt(paidNow,hrs)+'</div><div class="sub">'+money(paidNow)+' invoiced &amp; paid so far</div></div>'
+    +'</div></section>';
+
   const dl=deadlineOf(p);
   h+='<section class="card"><div class="sec-head"><h2>Status</h2>'+chipFor(p)
     +(dl?'<span style="font-size:11.5px;color:var(--muted)">deadline '+dmy(dl.due)+' — '+dl.act+'</span>':'')
@@ -328,13 +344,17 @@ function pageData(){
   h+='<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">'
     +'<select id="stSel" style="padding:6px;border-radius:6px;border:1.5px solid var(--line)">'+STATUSES.map(s=>'<option value="'+s.id+'">'+s.l+'</option>').join("")+'</select>'
     +'<label style="font-size:12px;color:var(--muted)">date <input type="date" id="stDate" value="'+todayISO()+'" style="padding:5px;border-radius:6px;border:1.5px solid var(--line)"></label>'
+    +'<label style="font-size:12px;color:var(--muted)">hours since last entry <input type="number" step="0.25" min="0" id="stHours" placeholder="e.g. 3.5" style="width:88px;padding:5px;border-radius:6px;border:1.5px solid var(--line)"></label>'
     +'<button class="cbtn" onclick="logStatus()">✓ Confirm — log to timeline</button>'
-    +'</div><div style="font-size:11px;color:var(--muted);margin-top:6px">Date defaults to today — override before confirming if logging retrospectively.</div>';
+    +'</div><div style="font-size:11px;color:var(--muted);margin-top:6px">Date defaults to today — override before confirming if logging retrospectively. Hours = time spent on <b>this stage</b> (since the previous entry); the timeline keeps the running total, and any hours can be edited later. Leave blank if not tracking.</div>';
   const lg=sortedLog(p);
   if(lg.length){
-    h+='<h4 style="font-size:12px;margin:12px 0 6px">Timeline</h4><table class="grid"><tr><th>Logged</th><th>Status</th><th>Deadline</th><th>Action due</th><th></th></tr>';
-    lg.forEach((e,i)=>{ const s=ST[e.st];
+    h+='<h4 style="font-size:12px;margin:12px 0 6px">Timeline</h4><table class="grid"><tr><th>Logged</th><th>Status</th><th>Deadline</th><th>Action due</th><th>Hours</th><th>Total hrs</th><th></th></tr>';
+    let run=0;
+    lg.forEach((e,i)=>{ const s=ST[e.st]; run+=Number(e.h)||0; const idx=p.log.indexOf(e);
       h+='<tr><td>'+dmy(e.d)+'</td><td>'+s.l+'</td><td>'+(s.days!=null?dmy(addDays(e.d,s.days))+' ('+s.days+' d)':'—')+'</td><td>'+s.act+'</td>'
+        +'<td style="width:82px"><div class="cell"><input type="number" step="0.25" min="0" data-lh="'+idx+'" value="'+(e.h||"")+'" placeholder="—"></div></td>'
+        +'<td style="font-variant-numeric:tabular-nums">'+hTxt(run)+'</td>'
         +'<td><button class="abtn del" onclick="delLog('+i+')">✕</button></td></tr>'; });
     h+='</table>';
   }
@@ -345,7 +365,11 @@ function logStatus(){
   const p=curProj(); if(!p) return;
   const st=document.getElementById("stSel").value;
   const d=document.getElementById("stDate").value||todayISO();
-  p.log.push({st,d,i:p.log.length});
+  const hEl=document.getElementById("stHours");
+  const hv=hEl? Number(hEl.value):0;
+  const e={st,d,i:p.log.length};
+  if(isFinite(hv)&&hv>0) e.h=hv;
+  p.log.push(e);
   save(); render();
 }
 function delLog(sortedIdx){
@@ -369,7 +393,7 @@ function pageRoster(){
   let pipeline=0, overdue=0;
   let h='<section class="card"><div class="sec-head"><h2>Project Roster — deadlines, actions & fee stages</h2><button class="addrow" onclick="newProject()">+ new project</button></div><div class="sec-body">';
   if(!rows.length){ h+='<div class="banner">No projects yet — click “+ new project”.</div></div></section>'; return h; }
-  h+='<table class="grid"><tr><th>Job #</th><th>Client</th><th>Address</th><th>Type</th><th>Dwl</th><th>Cx</th><th>Fee ex GST</th><th>Status</th><th>Since</th><th>Deadline</th><th>Action on deadline</th><th>Days</th><th>Next $ (ex GST)</th></tr>';
+  h+='<table class="grid"><tr><th>Job #</th><th>Client</th><th>Address</th><th>Type</th><th>Dwl</th><th>Cx</th><th>Fee ex GST</th><th>Hrs</th><th>$/hr</th><th>Status</th><th>Since</th><th>Deadline</th><th>Action on deadline</th><th>Days</th><th>Next $ (ex GST)</th></tr>';
   for(const r of rows){
     const pv=pendingValue(r.p);
     if(!r.p.hold && !(r.c&&r.c.st==="DONE")) pipeline+=pv.v;
@@ -383,6 +407,8 @@ function pageRoster(){
     h+='<tr class="clickable" onclick="selectProj(\''+r.p.id+'\')">'
       +'<td><b>'+(r.p.job||"—")+'</b></td><td>'+(r.p.client||"—")+'</td><td style="font-size:11.5px">'+(r.p.addr||"—")+'</td><td>'+(r.p.type||"—")+'</td><td>'+(r.p.dwell||"—")+'</td><td>'+(r.p.cx||"—")+'</td>'
       +'<td>'+money(fee(r.p))+'</td>'
+      +'<td>'+hTxt(projHours(r.p))+'</td>'
+      +'<td>'+rateTxt(fee(r.p)+adjFee(r.p),projHours(r.p))+'</td>'
       +'<td style="font-size:11.5px">'+(r.p.hold?'⏸ On hold':(r.c?ST[r.c.st].l:"—"))+'</td>'
       +'<td>'+(r.c?dmy(r.c.d):"—")+'</td>'
       +'<td>'+(r.dl?dmy(r.dl.due):"—")+'</td>'
@@ -433,6 +459,7 @@ function pageIncome(){
     +'<div class="statbox"><div class="lbl">Costs to date</div><div class="val" style="color:var(--red)">'+money(s.costToDate)+'</div><div class="sub">projected FY costs '+money(s.costFY)+' (recurring scheduled to 30 Jun)</div></div>'
     +'<div class="statbox"><div class="lbl">Profit to date (income − costs)</div><div class="val">'+money(s.profitToDate)+'</div><div class="sub">after tax ≈ '+money(s.profitToDate-incomeTax(s.profitToDate))+' (tax on profit '+money(incomeTax(s.profitToDate))+')</div></div>'
     +'<div class="statbox"><div class="lbl">Projected FY profit</div><div class="val">'+money(s.profitFY)+'</div><div class="sub">after tax ≈ '+money(s.profitFY-incomeTax(s.profitFY))+' (tax on profit '+money(incomeTax(s.profitFY))+')</div></div>'
+    +(fyHours()? '<div class="statbox"><div class="lbl">Effective hourly rate (FY)</div><div class="val">'+money(s.toDate/fyHours())+'/hr</div><div class="sub">'+money(s.toDate)+' received ÷ '+hTxt(fyHours())+' h · after costs '+money(Math.max(s.profitToDate,0)/fyHours())+'/hr</div></div>':'')
     +'</div>'
 
     +'<h4 style="font-size:12px;margin:14px 0 6px">Monthly summary</h4><div>'
@@ -442,6 +469,20 @@ function pageIncome(){
     +'</div>'
 
     +'<div style="font-size:11px;color:var(--muted);margin-top:6px">Tax: 2026–27 resident rates (0% to $18,200 · 15% to $45k · 30% to $135k · 37% to $190k · 45% above) + 2% Medicare levy. Income boxes show tax on gross income; profit boxes deduct the Costs tab first (taxable income = income − deductible costs). No other offsets. Guide only — not tax advice.</div>';
+
+  /* quoting benchmarks — what past jobs actually took */
+  const bm={};
+  for(const pr of T.projects){ const hh=projHours(pr), ff=fee(pr)+adjFee(pr);
+    if(!hh||!ff) continue;
+    const k=(pr.type||"—")+" · "+(pr.cx||"—");
+    (bm[k]=bm[k]||{n:0,h:0,f:0,d:0}); bm[k].n++; bm[k].h+=hh; bm[k].f+=ff; bm[k].d+=Number(pr.dwell)||0; }
+  const bkeys=Object.keys(bm).sort();
+  if(bkeys.length){
+    h+='<h4 style="font-size:12px;margin:14px 0 6px">Quoting benchmarks — what jobs actually take</h4><table class="grid"><tr><th>Job type · complexity</th><th>Jobs</th><th>Avg hours</th><th>Avg fee ex GST</th><th>Avg $/hr</th><th>Avg hrs / dwelling</th></tr>';
+    for(const k of bkeys){ const b=bm[k];
+      h+='<tr><td>'+k+'</td><td>'+b.n+'</td><td>'+hTxt(b.h/b.n)+'</td><td>'+money(b.f/b.n)+'</td><td>'+money(b.f/b.h)+'/hr</td><td>'+(b.d? hTxt(b.h/b.d):"—")+'</td></tr>'; }
+    h+='</table><div style="font-size:11px;color:var(--muted)">Only jobs with both hours and a fee are counted — use these to sanity-check the next fee proposal.</div>';
+  }
 
   const pays=payments().filter(x=>x.d>=s.start&&x.d<=s.end);
   const exp=expectedReceipts().filter(x=>x.d<=s.end);
@@ -654,15 +695,17 @@ document.addEventListener("input",e=>{
   const t=e.target;
   if(t.dataset.goal){ const v=Number(t.value); if(v>0) T.goal=v; save(); return; }
   if(t.dataset.cid){ const c=T.costs.find(x=>x.id===t.dataset.cid); if(c){ c[t.dataset.cf]=t.value; save(); if(t.tagName==="SELECT") render(); } return; }
+  if(t.dataset.lh!=null&&t.dataset.lh!==""){ const pp=curProj(); if(pp){ const ev=pp.log[Number(t.dataset.lh)];
+      if(ev){ const v=Number(t.value); if(isFinite(v)&&v>0) ev.h=v; else delete ev.h; save(); } } return; }
   const p=curProj(); if(!p) return;
   if(t.dataset.pf){ p[t.dataset.pf]=t.value; save(); if(t.tagName==="SELECT") render(); return; }
   if(t.dataset.pfinc){ const v=Number(t.value); p[t.dataset.pfinc]= isFinite(v)&&t.value!==""? +(v/(1+GST)).toFixed(2) : ""; save(); return; }
 });
 document.addEventListener("focusout",e=>{
   const t=e.target;
-  if(t && t.dataset && (t.dataset.pf||t.dataset.pfinc||t.dataset.goal||t.dataset.cid) && t.tagName!=="SELECT"){
+  if(t && t.dataset && (t.dataset.pf||t.dataset.pfinc||t.dataset.goal||t.dataset.cid||t.dataset.lh!=null) && t.tagName!=="SELECT"){
     clearTimeout(window.__rrT);
-    window.__rrT=setTimeout(()=>{ const a=document.activeElement; if(!a||!a.dataset||!(a.dataset.pf||a.dataset.pfinc||a.dataset.goal||a.dataset.cid)) render(); },200);
+    window.__rrT=setTimeout(()=>{ const a=document.activeElement; if(!a||!a.dataset||!(a.dataset.pf||a.dataset.pfinc||a.dataset.goal||a.dataset.cid||a.dataset.lh!=null)) render(); },200);
   }
 });
 
