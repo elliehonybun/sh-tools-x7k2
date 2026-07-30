@@ -112,6 +112,7 @@
   <span id="savenote"></span>
 </footer>
 
+<script src="gdrive-sync.js"></script>
 <script>
 "use strict";
 /* ============================================================
@@ -132,7 +133,8 @@ function save(){ try{
     localStorage.setItem(STBASE+"_cur", CURKEY);
     note("saved "+new Date().toLocaleTimeString()+" · project "+(getV("G0")||"default"));
     renderSlots();
-  }catch(e){ note("autosave unavailable — use Export"); } }
+  }catch(e){ note("autosave unavailable — use Export"); }
+  if(window.GSync) GSync.touch(); }
 function load(){ try{
     CURKEY=localStorage.getItem(STBASE+"_cur");
     const legacy=localStorage.getItem(STBASE);
@@ -938,8 +940,36 @@ function importState(ev){
 }
 function resetAll(){ if(confirm("Clear all data for THIS project instance ("+(getV("G0")||"default")+")?")){ S={vals:{},coll:{rl:[],gl:[],rooms:[],lts:[],walls:[]},seq:1,page:S.page,eePack:S.eePack}; save(); render(); } }
 
+/* ---------- Google Drive sync — every project instance travels together ---------- */
+function bundleSlots(){
+  const o={};
+  try{ if(CURKEY) localStorage.setItem(CURKEY,JSON.stringify(S)); }catch(e){}
+  for(const name of slotList()){ try{ o[name]=JSON.parse(localStorage.getItem(STBASE+"::"+name)||"null"); }catch(e){} }
+  return {slots:o, cur:(CURKEY||"").slice(STBASE.length+2)};
+}
+function restoreSlots(st){
+  if(!st||!st.slots) return;
+  try{
+    for(const k of slotList()) localStorage.removeItem(STBASE+"::"+k);
+    for(const [name,val] of Object.entries(st.slots)) if(val) localStorage.setItem(STBASE+"::"+name,JSON.stringify(val));
+    const names=Object.keys(st.slots);
+    const want=(st.cur&&st.slots[st.cur])? st.cur : (names[0]||"default");
+    CURKEY=slotKey(want); localStorage.setItem(STBASE+"_cur",CURKEY);
+    const x=localStorage.getItem(CURKEY);
+    S = x? JSON.parse(x) : {vals:{},coll:{rl:[],gl:[],rooms:[],lts:[],walls:[]},seq:1,page:"project",eePack:null};
+    ensureShape();
+  }catch(e){}
+  render();
+}
+function gsyncInit(){
+  if(!window.GSync) return;
+  GSync.init({ app:"datatool", fileName:"SectionH_ProjectDataTool.json",
+    device:(navigator.platform||"device"),
+    getState:bundleSlots, setState:restoreSlots });
+}
+
 /* boot */
-load(); render();
+load(); render(); gsyncInit();
 </script>
 <script>
 /* ================================================================

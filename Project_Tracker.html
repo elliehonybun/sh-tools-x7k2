@@ -86,12 +86,14 @@
   <span id="savenote"></span>
 </footer>
 
+<script src="gdrive-sync.js"></script>
 <script>
 "use strict";
 /* ============================ STORE ============================ */
 let T={ projects:[], seq:1, page:"data", cur:null, goal:2500, calYM:null, costs:[] };
 const STKEY="project_tracker_v1";
-function save(){ try{ localStorage.setItem(STKEY,JSON.stringify(T)); note("saved "+new Date().toLocaleTimeString()); }catch(e){ note("autosave unavailable — use Export"); } }
+function save(){ try{ localStorage.setItem(STKEY,JSON.stringify(T)); note("saved "+new Date().toLocaleTimeString()); }catch(e){ note("autosave unavailable — use Export"); }
+  if(window.GSync) GSync.touch(); }
 function ensureShape(){ if(!T.projects) T.projects=[]; if(!T.page) T.page="data"; if(!T.seq) T.seq=1; if(!(Number(T.goal)>0)) T.goal=2500; if(!T.calYM) T.calYM=todayISO().slice(0,7); if(!T.costs) T.costs=[]; }
 function load(){ try{ const x=localStorage.getItem(STKEY); if(x) T=JSON.parse(x); }catch(e){} ensureShape(); }
 function note(t){ document.getElementById("savenote").textContent=t; }
@@ -686,8 +688,17 @@ function importJSON(ev){
   rd.readAsText(f); ev.target.value="";
 }
 
+/* ---------- Google Drive sync ---------- */
+function gsyncInit(){
+  if(!window.GSync) return;
+  GSync.init({ app:"tracker", fileName:"SectionH_ProjectTracker.json",
+    device:(navigator.platform||"device"),
+    getState:()=>T,
+    setState:st=>{ T=st; ensureShape(); try{ localStorage.setItem(STKEY,JSON.stringify(T)); }catch(e){} render(); } });
+}
+
 /* boot */
-load(); render();
+load(); render(); gsyncInit();
 </script>
 </body>
 </html>
