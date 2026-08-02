@@ -3,6 +3,13 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="manifest" href="manifest-datatool.json">
+<meta name="theme-color" content="#111827">
+<link rel="icon" type="image/png" sizes="192x192" href="icon-datatool-192.png">
+<link rel="apple-touch-icon" href="icon-datatool-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Data Tool">
 <title>Project Data Tool — Section H (NCC 2022 Amd 2 = NCC 2025)</title>
 <style>
   :root{
@@ -125,10 +132,22 @@ const STBASE="part13_dts_tool_v2";
 let CURKEY=null;
 function slotKey(j){ j=(j==null?"":String(j)).trim(); return STBASE+"::"+(j||"default"); }
 function slotList(){ const out=[]; try{ for(let i=0;i<localStorage.length;i++){ const k=localStorage.key(i); if(k&&k.startsWith(STBASE+"::")) out.push(k.slice(STBASE.length+2)); } }catch(e){} return out.sort(); }
+
+/* ---- deletion tombstones, so a slot deleted here doesn't come back on the
+   next sync from a device that still remembers it ---- */
+const TOMBKEY=STBASE+"_tombs";
+function tombs(){ try{ return JSON.parse(localStorage.getItem(TOMBKEY)||"{}"); }catch(e){ return {}; } }
+function setTombs(t){ try{ localStorage.setItem(TOMBKEY,JSON.stringify(t||{})); }catch(e){} }
+function tombstone(name){ if(!name) return; const t=tombs(); t[name]=new Date().toISOString(); setTombs(t); }
+function untomb(name){ const t=tombs(); if(t[name]){ delete t[name]; setTombs(t); } }
+const slotName=k=>(k||"").slice(STBASE.length+2);
+
 function save(){ try{
     const nk=slotKey(getV("G0"));
-    if(CURKEY&&nk!==CURKEY) localStorage.removeItem(CURKEY); /* job number changed → rename slot */
+    if(CURKEY&&nk!==CURKEY){ localStorage.removeItem(CURKEY); tombstone(slotName(CURKEY)); } /* job number changed → rename slot */
     CURKEY=nk;
+    untomb(slotName(CURKEY));            /* re-created → cancel any old tombstone */
+    S.updatedAt=new Date().toISOString();/* stamps this project for merge sync */
     localStorage.setItem(CURKEY, JSON.stringify(S));
     localStorage.setItem(STBASE+"_cur", CURKEY);
     note("saved "+new Date().toLocaleTimeString()+" · project "+(getV("G0")||"default"));
@@ -940,32 +959,58 @@ function importState(ev){
 }
 function resetAll(){ if(confirm("Clear all data for THIS project instance ("+(getV("G0")||"default")+")?")){ S={vals:{},coll:{rl:[],gl:[],rooms:[],lts:[],walls:[]},seq:1,page:S.page,eePack:S.eePack}; save(); render(); } }
 
-/* ---------- Google Drive sync — every project instance travels together ---------- */
-function bundleSlots(){
+/* ---------- Google Drive sync — every project instance travels together ----------
+   Projects are keyed by job number, which both devices agree on, so a merge is
+   unambiguous: same job number = same project, different job number = different
+   project that must survive. Adding 26022 on the iPad while the desktop holds
+   26020 now keeps both. */
+function blankState(){ return {vals:{},coll:{rl:[],gl:[],rooms:[],lts:[],walls:[]},seq:1,page:"project",eePack:null}; }
+function flushCurrent(){ try{ if(CURKEY){ if(!S.updatedAt) S.updatedAt=new Date().toISOString(); localStorage.setItem(CURKEY,JSON.stringify(S)); } }catch(e){} }
+function localSlots(){
   const o={};
-  try{ if(CURKEY) localStorage.setItem(CURKEY,JSON.stringify(S)); }catch(e){}
   for(const name of slotList()){ try{ o[name]=JSON.parse(localStorage.getItem(STBASE+"::"+name)||"null"); }catch(e){} }
-  return {slots:o, cur:(CURKEY||"").slice(STBASE.length+2)};
+  return o;
 }
+function bundleSlots(){
+  flushCurrent();
+  return {slots:localSlots(), tombs:tombs(), cur:slotName(CURKEY)};
+}
+/* write a set of slots to localStorage and re-open the best one */
+function applySlots(map, preferred){
+  for(const k of slotList()) localStorage.removeItem(STBASE+"::"+k);
+  for(const [name,val] of Object.entries(map)) if(val) localStorage.setItem(STBASE+"::"+name,JSON.stringify(val));
+  const names=Object.keys(map);
+  const want = (preferred&&map[preferred]) ? preferred : (names[0]||"default");
+  CURKEY=slotKey(want);
+  try{ localStorage.setItem(STBASE+"_cur",CURKEY); }catch(e){}
+  let x=null; try{ x=localStorage.getItem(CURKEY); }catch(e){}
+  S = x? JSON.parse(x) : blankState();
+  ensureShape();
+}
+/* MERGE — the normal sync path. Never deletes a project that exists only here. */
+function mergeSlots(st){
+  if(!st||!st.slots) return false;
+  try{
+    flushCurrent();
+    const here=slotName(CURKEY);
+    const r=GSync.mergeMaps(localSlots(), st.slots, tombs(), st.tombs);
+    applySlots(r.map, r.map[here] ? here : st.cur);   /* stay on the project we were editing */
+    setTombs(r.tombs);
+  }catch(e){ return false; }
+  render();
+  return true;
+}
+/* HARD REPLACE — only from the deliberate "Load Drive copy" action */
 function restoreSlots(st){
   if(!st||!st.slots) return;
-  try{
-    for(const k of slotList()) localStorage.removeItem(STBASE+"::"+k);
-    for(const [name,val] of Object.entries(st.slots)) if(val) localStorage.setItem(STBASE+"::"+name,JSON.stringify(val));
-    const names=Object.keys(st.slots);
-    const want=(st.cur&&st.slots[st.cur])? st.cur : (names[0]||"default");
-    CURKEY=slotKey(want); localStorage.setItem(STBASE+"_cur",CURKEY);
-    const x=localStorage.getItem(CURKEY);
-    S = x? JSON.parse(x) : {vals:{},coll:{rl:[],gl:[],rooms:[],lts:[],walls:[]},seq:1,page:"project",eePack:null};
-    ensureShape();
-  }catch(e){}
+  try{ applySlots(st.slots, st.cur); setTombs(st.tombs||{}); }catch(e){}
   render();
 }
 function gsyncInit(){
   if(!window.GSync) return;
   GSync.init({ app:"datatool", fileName:"SectionH_ProjectDataTool.json",
     device:(navigator.platform||"device"),
-    getState:bundleSlots, setState:restoreSlots });
+    getState:bundleSlots, mergeState:mergeSlots, setState:restoreSlots });
 }
 
 /* boot */

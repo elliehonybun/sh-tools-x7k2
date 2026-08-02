@@ -3,6 +3,13 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="manifest" href="manifest-tracker.json">
+<meta name="theme-color" content="#111827">
+<link rel="icon" type="image/png" sizes="192x192" href="icon-tracker-192.png">
+<link rel="apple-touch-icon" href="icon-tracker-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Tracker">
 <title>Project Tracker — Roster, Fees, Projection & Calendar</title>
 <style>
   :root{
@@ -90,12 +97,66 @@
 <script>
 "use strict";
 /* ============================ STORE ============================ */
-let T={ projects:[], seq:1, page:"data", cur:null, goal:2500, calYM:null, costs:[] };
+let T={ projects:[], seq:1, page:"data", cur:null, goal:2500, calYM:null, costs:[], tombs:{} };
 const STKEY="project_tracker_v1";
-function save(){ try{ localStorage.setItem(STKEY,JSON.stringify(T)); note("saved "+new Date().toLocaleTimeString()); }catch(e){ note("autosave unavailable — use Export"); }
+
+/* ---- ids -------------------------------------------------------------
+   Ids used to come from a per-device counter (String(T.seq++)), so the
+   desktop and the iPad both minted "5" for different projects — which makes
+   them impossible to merge. Ids are now collision-proof. Old numeric ids are
+   migrated ONCE, derived from the job number (or a content hash) so BOTH
+   devices independently arrive at the same new id for the same record. */
+function uid(){ return window.GSync? GSync.newId() : Date.now().toString(36)+"-"+Math.random().toString(36).slice(2,8); }
+function hash32(s){ let h=5381; for(let i=0;i<s.length;i++) h=((h<<5)+h+s.charCodeAt(i))>>>0; return h.toString(36); }
+function migrateIds(){
+  const old=/^\d+$/, used={}, remap={};
+  const assign=(rec,prefix,natural)=>{
+    const bare=JSON.stringify(Object.assign({},rec,{id:0,updatedAt:0}));
+    let base = (natural&&String(natural).trim())
+      ? prefix+"_"+String(natural).trim().toLowerCase().replace(/\s+/g,"")
+      : prefix+"_h"+hash32(bare);
+    let id=base,n=2; while(used[id]) id=base+"_"+(n++);
+    used[id]=1; return id;
+  };
+  let changed=false;
+  for(const p of T.projects){ if(p&&old.test(String(p.id))){ const nid=assign(p,"p",p.job); remap[p.id]=nid; p.id=nid; changed=true; } else if(p) used[p.id]=1; }
+  for(const c of T.costs){ if(c&&old.test(String(c.id))){ c.id=assign(c,"c",""); changed=true; } else if(c) used[c.id]=1; }
+  if(T.cur&&remap[T.cur]) T.cur=remap[T.cur];
+  return changed;
+}
+
+/* ---- change stamping -------------------------------------------------
+   Every save diffs each record against how it looked at the last save and
+   stamps only what actually changed. That keeps merge decisions honest —
+   opening the tracker doesn't make this device "win" every project. */
+let _sig={};
+function baseline(){ _sig={}; stampChanges(true); }
+function stampChanges(quiet){
+  const now=new Date().toISOString(), seen={};
+  for(const arr of [T.projects,T.costs]){
+    for(const r of (arr||[])){
+      if(!r||r.id==null) continue;
+      const bare=JSON.stringify(Object.assign({},r,{updatedAt:0}));
+      seen[r.id]=bare;
+      if(!quiet && _sig[r.id]!==undefined && _sig[r.id]!==bare) r.updatedAt=now;
+      if(!quiet && _sig[r.id]===undefined && Object.keys(_sig).length) r.updatedAt=r.updatedAt||now;
+    }
+  }
+  const setSig=JSON.stringify({goal:T.goal,page:T.page,cur:T.cur,calYM:T.calYM});
+  if(!quiet && _sig.__set!==undefined && _sig.__set!==setSig) T.settingsAt=now;
+  seen.__set=setSig;
+  _sig=seen;
+}
+/* deletion tombstones — so a delete here isn't undone by a device that still has it */
+function tombstone(id){ if(!T.tombs) T.tombs={}; T.tombs[id]=new Date().toISOString(); }
+
+function save(){ stampChanges();
+  try{ localStorage.setItem(STKEY,JSON.stringify(T)); note("saved "+new Date().toLocaleTimeString()); }catch(e){ note("autosave unavailable — use Export"); }
   if(window.GSync) GSync.touch(); }
-function ensureShape(){ if(!T.projects) T.projects=[]; if(!T.page) T.page="data"; if(!T.seq) T.seq=1; if(!(Number(T.goal)>0)) T.goal=2500; if(!T.calYM) T.calYM=todayISO().slice(0,7); if(!T.costs) T.costs=[]; }
-function load(){ try{ const x=localStorage.getItem(STKEY); if(x) T=JSON.parse(x); }catch(e){} ensureShape(); }
+function ensureShape(){ if(!T.projects) T.projects=[]; if(!T.page) T.page="data"; if(!T.seq) T.seq=1; if(!(Number(T.goal)>0)) T.goal=2500; if(!T.calYM) T.calYM=todayISO().slice(0,7); if(!T.costs) T.costs=[]; if(!T.tombs) T.tombs={}; }
+function load(){ try{ const x=localStorage.getItem(STKEY); if(x) T=JSON.parse(x); }catch(e){} ensureShape();
+  if(migrateIds()){ try{ localStorage.setItem(STKEY,JSON.stringify(T)); }catch(e){} }
+  baseline(); }
 function note(t){ document.getElementById("savenote").textContent=t; }
 
 /* ============================ CONSTANTS ============================ */
@@ -126,8 +187,8 @@ function fyStartISO(){ const d=new Date(); const y=(d.getMonth()>=6)?d.getFullYe
 function fyEndISO(){ const s=pd(fyStartISO()); return (s.getFullYear()+1)+"-06-30"; }
 
 /* ============================ PROJECT HELPERS ============================ */
-function newProject(){ const p={id:String(T.seq++), job:"",addr:"",client:"",designer:"",type:"",dwell:"",cx:"",fee:"",pfee:"",adj:"",hold:false,log:[]}; T.projects.push(p); T.cur=p.id; T.page="data"; save(); render(); }
-function delProject(id){ if(!confirm("Delete this project and its timeline?")) return; T.projects=T.projects.filter(p=>p.id!==id); if(T.cur===id) T.cur=null; save(); render(); }
+function newProject(){ const p={id:uid(), updatedAt:new Date().toISOString(), job:"",addr:"",client:"",designer:"",type:"",dwell:"",cx:"",fee:"",pfee:"",adj:"",hold:false,log:[]}; T.projects.push(p); T.cur=p.id; T.page="data"; save(); render(); }
+function delProject(id){ if(!confirm("Delete this project and its timeline?")) return; T.projects=T.projects.filter(p=>p.id!==id); tombstone(id); if(T.cur===id) T.cur=null; save(); render(); }
 function proj(id){ return T.projects.find(p=>p.id===id); }
 function curProj(){ return T.cur? proj(T.cur) : null; }
 function toggleHold(){ const p=curProj(); if(!p) return; p.hold=!p.hold; save(); render(); }
@@ -248,8 +309,8 @@ function monthPaid(y,m){ const pre=y+"-"+String(m).padStart(2,"0");
 /* ============================ COSTS ============================ */
 const COSTCATS=["Software / subscription","Equipment","Insurance","Registration / accreditation","Travel / vehicle","Office / utilities","Training","Other"];
 const FREQS=["one-off","weekly","fortnightly","monthly","quarterly","yearly"];
-function newCost(){ T.costs.push({id:String(T.seq++), desc:"", cat:"", amt:"", freq:"one-off", start:todayISO(), end:""}); save(); render(); }
-function delCost(id){ T.costs=T.costs.filter(c=>c.id!==id); save(); render(); }
+function newCost(){ T.costs.push({id:uid(), updatedAt:new Date().toISOString(), desc:"", cat:"", amt:"", freq:"one-off", start:todayISO(), end:""}); save(); render(); }
+function delCost(id){ T.costs=T.costs.filter(c=>c.id!==id); tombstone(id); save(); render(); }
 function nextDate(d,freq){ const x=pd(d);
   if(freq==="weekly") x.setDate(x.getDate()+7);
   else if(freq==="fortnightly") x.setDate(x.getDate()+14);
@@ -731,13 +792,44 @@ function importJSON(ev){
   rd.readAsText(f); ev.target.value="";
 }
 
-/* ---------- Google Drive sync ---------- */
+/* ---------- Google Drive sync ----------
+   Projects and costs merge record by record: newest edit to a given record
+   wins, and a record that exists on only one device is always kept. Settings
+   (goal, current page, calendar month) merge as one block by settingsAt. */
+const byId=arr=>{ const o={}; for(const r of (arr||[])) if(r&&r.id!=null) o[r.id]=r; return o; };
+const toArr=map=>Object.keys(map).map(k=>map[k]);
+
+function mergeTracker(st){
+  if(!st||!st.projects) return false;
+  try{
+    stampChanges();                       /* make sure local edits are stamped first */
+    const P=GSync.mergeMaps(byId(T.projects), byId(st.projects), T.tombs, st.tombs);
+    const C=GSync.mergeMaps(byId(T.costs),    byId(st.costs),    T.tombs, st.tombs);
+    const keepCur = T.cur && P.map[T.cur] ? T.cur : (st.cur && P.map[st.cur] ? st.cur : null);
+    const set = GSync.mergeSettings(
+      {goal:T.goal, calYM:T.calYM},
+      {goal:st.goal, calYM:st.calYM},
+      T.settingsAt, st.settingsAt);
+    T.projects = toArr(P.map);
+    T.costs    = toArr(C.map);
+    T.tombs    = Object.assign({}, P.tombs, C.tombs);
+    T.goal     = set.goal; T.calYM = set.calYM;
+    T.cur      = keepCur;                 /* stay where we are; never follow the other device */
+    T.settingsAt = GSync.ts(st.settingsAt)>GSync.ts(T.settingsAt) ? st.settingsAt : T.settingsAt;
+    ensureShape();
+    try{ localStorage.setItem(STKEY,JSON.stringify(T)); }catch(e){}
+    baseline();
+  }catch(e){ return false; }
+  render();
+  return true;
+}
 function gsyncInit(){
   if(!window.GSync) return;
   GSync.init({ app:"tracker", fileName:"SectionH_ProjectTracker.json",
     device:(navigator.platform||"device"),
-    getState:()=>T,
-    setState:st=>{ T=st; ensureShape(); try{ localStorage.setItem(STKEY,JSON.stringify(T)); }catch(e){} render(); } });
+    getState:()=>{ stampChanges(); return T; },
+    mergeState:mergeTracker,
+    setState:st=>{ T=st; ensureShape(); try{ localStorage.setItem(STKEY,JSON.stringify(T)); }catch(e){} baseline(); render(); } });
 }
 
 /* boot */
