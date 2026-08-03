@@ -1434,6 +1434,52 @@ async function fillDocx(b64, map, lists){
   return {blob, missing:[...missing]};
 }
 
+
+/* ---------------------------------------------------------------------------
+   Adopt a template that is already in the Drive folder.
+
+   Uploading through the button writes a pointer into T.templates. A file put
+   into the folder by hand writes nothing, so the tool could not see it. This
+   looks for the filename the slot expects and adopts it — which is what
+   someone who has just dragged a .docx into the folder expects to happen.
+   ------------------------------------------------------------------------- */
+let _tplLookedFor = {};
+function adoptTemplate(kind, loud){
+  if(!window.GSync || !GSync.ready() || !GSync.findNamed){
+    if(loud) alert("Connect Google Drive first, then try again.");
+    return;
+  }
+  if(tplRec(kind)){ if(loud) alert("That slot already has a template."); return; }
+  /* A slot that was deliberately emptied carries a removal tombstone. Silently
+     re-adopting the file would undo that decision — and, because the record
+     then syncs, undo it on the other device too. Only an explicit "Look in
+     Drive" may bring it back. */
+  const rec=templates()[kind];
+  if(rec && rec.removed && !loud) return;
+  if(rec && rec.removed && loud &&
+     !confirm("This template was removed. Look for it in Drive and put it back?")) return;
+  const want=tplName(kind);
+  if(!loud && _tplLookedFor[kind]) return;      /* once per session unless asked */
+  _tplLookedFor[kind]=true;
+  GSync.findNamed(want,(e,found)=>{
+    if(e){ if(loud) alert("Couldn't search your Drive folder:\n\n"+e); return; }
+    if(!found){
+      if(loud) alert("No file called\n\n    "+want+"\n\nin your “"+GSync.folderName()
+        +"” Drive folder.\n\nEither rename the file to exactly that, or use Upload "
+        +"and pick it from your computer.");
+      return;
+    }
+    templates()[kind]={ name:found.name, driveName:found.name, fileId:found.id,
+                        modifiedTime:found.modifiedTime, at:new Date().toISOString(), size:0,
+                        adopted:true };
+    save(); render();
+    const note=document.getElementById("savenote");
+    if(note) note.textContent="found "+found.name+" in Drive";
+    if(loud) alert("Found "+found.name+" in your Drive folder — the slot is filled.");
+  });
+}
+function adoptAllTemplates(){ for(const [k] of DOCTYPES) if(!tplRec(k)) adoptTemplate(k,false); }
+
 function uploadTemplate(kind, ev){
   const f=ev.target.files[0]; ev.target.value="";
   if(!f) return;
@@ -1553,6 +1599,7 @@ function pageDocs(){
       +'<tr><td class="plabel">Date</td><td><div class="cell"><input type="date" id="docDate" value="'+todayISO()+'"></div></td></tr>'
       +'</table>';
     h+='<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">'
+      +'<button class="abtn" onclick="adoptAllTemplates()" title="Look for template files already in your Google Drive folder">Look in Drive</button> '
       +'<button class="cbtn" onclick="generateDoc(\'invoice\')"'+(tplRec("invoice")?'':' disabled title="Upload an invoice template first"')+'>Generate invoice (.docx)</button>'
       +'<button class="cbtn" onclick="generateDoc(\'proposal\')"'+(tplRec("proposal")?'':' disabled title="Upload a fee proposal template first"')+'>Generate fee proposal (.docx)</button>'
       +'</div>';
@@ -1655,7 +1702,7 @@ const SEC = [
   {id:"G9",l:"Storeys",t:"sel",o:["single","2+"],src:"Elevations",def:"single"},
   {id:"G10",l:"Total floor area (m²) — conditioned (Class 1 + conditioned 10a)",t:"num",u:"m²",src:"Area schedule / orange A= annotations"},
   {id:"G10u",l:"Unconditioned floor area (m²) — garage etc.",t:"num",u:"m²",src:"Blue A= annotations",def:"0"},
-  {id:"G11",l:"Conditioned spaces",t:"text",src:"Floor plan + mech.",def:"all habitable"},
+  {id:"G11",l:"Conditioned spaces",t:"text",ro:true,src:"Derived — press Apply totals on the room schedule"},
   {id:"G12",l:"DA specifies insulation (NSW)",t:"bool",src:"DA conditions / BASIX",def:"n"},
   {id:"WH1",l:"Main heating type",t:"sel",o:["RC air-conditioner (non-ducted)","RC air-conditioner (ducted)","gas ducted","gas room heater","electric resistance","wood heater","hydronic — heat pump","hydronic — gas"],src:"Mechanical schedule",def:"RC AC min MEPS"},
   {id:"WH1s",l:"Main heating rating (GEMS stars)",t:"num",u:"stars",src:"GEMS registry · GUIDE (heating): MEPS-min RC split ≈ 2★ · typical new split 3–3.5★ · premium 4.5–6★ · ducted typically 0.5–1★ lower"},
@@ -2655,7 +2702,10 @@ function inputHTML(key,p){
     return '<select data-key="'+key+'">'+opts.map(([val,lab])=>'<option value="'+val+'"'+(String(v)===val?" selected":"")+'>'+lab+'</option>').join("")+'</select>';
   }
   const typ = p.t==="num" ? "number" : "text";
-  return '<input type="'+typ+'" step="any" data-key="'+key+'" value="'+(v==null?"":String(v).replace(/"/g,"&quot;"))+'">';
+  return '<input type="'+typ+'" step="any" data-key="'+key+'"'
+    +(p.ro?' disabled title="Derived — press Apply totals on the room schedule"':'')
+    +(p.ti?' title="'+String(p.ti).replace(/"/g,"&quot;")+'"':'')
+    +' value="'+(v==null?"":String(v).replace(/"/g,"&quot;"))+'">';
 }
 
 function paramRow(p){
@@ -2680,6 +2730,20 @@ function linkedRow(gid){
     +'<td class="pstat"><span class="chip '+st+'">'+STLBL[st]+'</span></td><td class="pact"></td></tr>';
 }
 
+/* Area follows height × width as they are typed. It is written as a
+   calculated value, so typing over it makes it yours again and the
+   override is not silently recomputed. */
+function glAutoArea(key){
+  const m=String(key||"").match(/^c\.gl\.([^.]+)\.(h|w)$/); if(!m) return;
+  const uid=m[1], g=f=>Number(getV("c.gl."+uid+"."+f))||0;
+  const H=g("h"), W=g("w"); if(!(H>0&&W>0)) return;
+  const st=getSt("c.gl."+uid+".area");
+  if(st!=="none" && st!=="calc") return;      /* an entered area wins */
+  const a=(H*W).toFixed(2).replace(/\.?0+$/,"");
+  S.vals["c.gl."+uid+".area"]={v:a,st:"calc",at:p13Now()};
+  syncMirrors("c.gl."+uid+".area", a, null);
+  p13Save();
+}
 function roomTotals(){ let ca=0,ua=0,n=0,beds=0,miss=0;
   for(const uid of S.coll.rooms){ const g=f=>getV("c.rooms."+uid+"."+f);
     n++; const a=Number(g("area"))||0; if(!a) miss++;
@@ -2687,7 +2751,39 @@ function roomTotals(){ let ca=0,ua=0,n=0,beds=0,miss=0;
     if(unc) ua+=a; else ca+=a;
     if(g("rtype")==="Bedroom") beds++; }
   return {ca,ua,n,beds,miss}; }
-function applyRoomTotals(){ const t=roomTotals(); setV("G10",t.ca.toFixed(1),"calc"); setV("G10u",t.ua.toFixed(1),"calc"); p13Render(); }
+/* The room schedule already knows the floor type of every room, which is
+   exactly the GZ1–GZ3 split the glazing calculator needs — so applying
+   totals fills that too rather than leaving it to be retyped. */
+function roomFloorSplit(){
+  let direct=0, susp=0, upper=0;
+  for(const uid of S.coll.rooms){ const g=f=>getV("c.rooms."+uid+"."+f);
+    if(g("heat")==="none" && g("cool")==="none") continue;   /* conditioned only */
+    const a=Number(g("area"))||0, ft=g("ftype");
+    if(ft==="Upper") upper+=a; else if(ft==="Ground: Suspended") susp+=a; else direct+=a;
+  }
+  return {direct,susp,upper};
+}
+/* G11 names the spaces the assessment covers. It used to be free text that
+   nothing read; it is now derived from the schedule so it cannot disagree
+   with the areas underneath it. */
+function conditionedSpaces(){
+  const names=[];
+  for(const uid of S.coll.rooms){ const g=f=>getV("c.rooms."+uid+"."+f);
+    if(g("heat")==="none" && g("cool")==="none") continue;
+    const n=g("tag"); if(n) names.push(n);
+  }
+  return names;
+}
+function applyRoomTotals(){
+  const t=roomTotals(), f=roomFloorSplit(), names=conditionedSpaces();
+  setV("G10",t.ca.toFixed(1),"calc");
+  setV("G10u",t.ua.toFixed(1),"calc");
+  setV("GZ1",f.direct.toFixed(1),"calc");
+  setV("GZ2",f.susp.toFixed(1),"calc");
+  setV("GZ3",f.upper.toFixed(1),"calc");
+  if(names.length) setV("G11",names.join(", "),"calc"); else dropV("G11");
+  p13Render();
+}
 
 function collHTML(sec){
   const c = sec.collRef ? (SEC.find(x=>x.id===sec.collRef)||{}).coll : sec.coll;
@@ -2702,11 +2798,20 @@ function collHTML(sec){
       +(c.id==="gl"?'<button class="abtn" style="padding:2px 5px" title="Split window into A/B rows (two operation types in one window)" onclick="splitGlRow(\''+uid+'\')">⎘</button>':'')
       +'</td></tr>';
   }
-  if(c.id==="rooms"){ const t=roomTotals();
+  if(c.id==="gl"){
+    h+='</table><div class="banner" style="background:#fffbeb;border-color:#fcd34d;color:#78350f">'
+      +'<b>P and H.</b> P is the horizontal projection of the eave or device. '
+      +'<b>H is measured from the BASE OF THE GLAZING</b> up to the underside of that projection — '
+      +'not from floor level, and not from the sill. Where the head of the opening sits more than '
+      +'0.5 m below the projection, the calculator halves the effective P/H, as the ABCB method requires.'
+      +'<span style="display:block;font-size:10.5px;margin-top:3px">Area fills itself from height × width; '
+      +'type over it for an irregular opening.</span></div>';
+  }
+  else if(c.id==="rooms"){ const t=roomTotals();
     h+='</table><div class="banner" style="background:#f0f9ff;border-color:#bae6fd;color:#0c4a6e">'+t.n+' rooms ('+t.beds+' bedroom'+(t.beds===1?"":"s")+') · conditioned '+t.ca.toFixed(1)+' m² · unconditioned '+t.ua.toFixed(1)+' m²'+(t.miss?' · ⚠ '+t.miss+' room(s) missing area':'')
-      +' <button class="abtn" style="margin-left:8px" onclick="applyRoomTotals()">Apply totals → G10 / G10u</button>'
-      +'<span style="display:block;font-size:10.5px;margin-top:2px">Unconditioned = heating and cooling both \'none\'. Totals feed the WoH floor-area factor; split G10 into GZ1–GZ3 by floor construction for the glazing calc.</span></div>'; }
-  else h+='</table>';
+      +' <button class="abtn" style="margin-left:8px" onclick="applyRoomTotals()">Apply totals → G10 · G10u · GZ1–GZ3 · G11</button>'
+      +'<span style="display:block;font-size:10.5px;margin-top:2px">Unconditioned = heating and cooling both \'none\'. Applying totals also splits the conditioned area into GZ1–GZ3 by floor type for the glazing calculator, and names the conditioned spaces in G11.</span></div>'; }
+  else if(c.id!=="gl") h+='</table>';
   h+='<button class="addrow" onclick="addRow(\''+c.id+'\')">+ add row</button>';
   h+=' <button class="addrow" style="border-color:var(--green);color:var(--green)" onclick="exportCollCSV(\''+c.id+'\')">\u2b07 CSV</button>';
   if(c.id==="gl") h+=' <button class="addrow" style="border-color:var(--green);color:var(--green)" onclick="exportWindowsCSV()">⬇ Export windows → Excel (CSV for glazing calculator)</button>';
@@ -2849,7 +2954,20 @@ function h6Fields(){
 
   /* --- glazing -------------------------------------------------------- */
   const G=gzReport();
-  if(G && G.applicable && !G.blocked){
+  if(G && G.applicable && !G.blocked && G.proposedEntered===false){
+    const req=G.required||{};
+    const lines=Object.keys(req).map(t=>t+" — U "+req[t].u+" / SHGC "+req[t].shgc);
+    F["glazing_narrative"]= lines.length
+      ? ("No glazing has been specified yet. To satisfy 13.3.2 and 13.3.3 the windows must achieve at "
+         +"least: "+lines.join("; ")+". These are whole-of-system values including the frame.")
+      : "No glazing has been specified yet, and the required specification has not been calculated.";
+    L.glazing=(G.schedule||[]).map(s=>({tag:s.tag, product:s.open||"—", u:"—", shgc:"—",
+                                        facing:s.sector||"—"}));
+    L.glzspec=Object.keys(req).map(t=>({type:t, product:"To be selected", u:String(req[t].u),
+                                        shgc:String(req[t].shgc)}));
+    gap("glazing_schedule","windows not yet chosen — the required specification is shown instead");
+  }
+  else if(G && G.applicable && !G.blocked){
     const prod=t=>(G.products||[]).find(p=>p.type===t)||null;
     L.glazing=(G.schedule||[]).map(s=>{ const p=prod(s.open);
       return {tag:s.tag, product:(s.open||"")+(p? " — "+p.glazing+", "+p.frame : ""),
@@ -3120,6 +3238,7 @@ document.addEventListener("input",e=>{
   if(e.target.tagName==="SELECT"&&(v==="true"||v==="false")) v=(v==="true");
   // manual entry => assumption (purple); calc cells too
   setV(k,v,"assum");
+  glAutoArea(k);                       /* height × width → area */
   syncMirrors(k, e.target.value, e.target);
   if(e.target.tagName==="SELECT"){ p13Render(); return; } // selects: safe to refresh (nothing being typed); needed for N/A gates & banners
   // typed fields: update styling IN PLACE — a full re-render mid-keystroke reset the caret and reversed the text
@@ -3473,7 +3592,7 @@ const GD = {"Projections": [0, 0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 1, 1.2, 1.4, 1.6, 
     {f:"frame",l:"Frame col.",t:"sel",o:GD.FrameColours},
     {f:"open",l:"Openability",t:"sel",o:GD.Openabilities},
     {f:"u",l:"U",t:"num"},{f:"shgc",l:"SHGC",t:"num"},
-    {f:"p",l:"P m",t:"num"},{f:"sh",l:"Shade H m",t:"num"},
+    {f:"p",l:"P m",t:"num"},{f:"sh",l:"Shade H m",t:"num",ti:"H = vertical distance from the BASE OF THE GLAZING up to the underside of the shading device. Not from the floor, and not from the sill."},
     {f:"dev",l:"Adj. device",t:"sel",o:["device"]}
   ]};
   gz.params = [
@@ -3485,11 +3604,27 @@ const GD = {"Projections": [0, 0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 1, 1.2, 1.4, 1.6, 
     {id:"GZ5",l:"CZ5 only: full brick house (internal brick + ext. brick cavity)",t:"sel",o:GD.BrickCavity.filter(Boolean),src:"↳ cross-checked against W1",def:"No"}
   ];
   gz.intro = "<p><b>Part 13.3 sets no required U-Value or SHGC for any single window.</b> It sets two whole-of-dwelling budgets and lets the glazing meet them as a package. That is why a poor window can be carried by better ones — and why changing any one window changes the result for all of them.</p><p><b>Two tests, run together.</b><br><b>13.3.2 — winter</b> (climate zones 2–8). Heat lost through the glazing, divided by the useful solar heat it gains in winter, must not exceed the conductance allowance C<sub>U</sub>:<br><code>Σ(A · U · κ) ÷ Σ(A · SHGC · E<sub>w</sub> · ω) ≤ C<sub>U</sub></code><br><b>13.3.3 — summer</b> (climate zones 1–7). Solar heat gained in summer must not exceed C<sub>SHGC</sub> × the total floor area:<br><code>Σ(A · SHGC · E<sub>s</sub> · σ) ≤ C<sub>SHGC</sub> × A<sub>floor</sub></code><br>Zone 1 runs summer only; zone 8 winter only; zones 2–7 both.</p><p><b>Where each term comes from.</b> <i>A</i> — the opening area, height × width or the stated area, whichever is greater. <i>U</i> and <i>SHGC</i> — whole-of-system values including the frame, off the WERS certificate; SHGC is capped at 0.70 in the calculation however high the product's actual figure. <i>E<sub>w</sub></i> / <i>E<sub>s</sub></i> — exposure for the opening's orientation, interpolated on its shading ratio P/H (projection over height), capped at 2; an adjustable external device counts as P/H = 2 in summer. <i>κ, ω, σ</i> — multipliers for orientation, room type, storey, frame colour and floor finish. <i>C<sub>U</sub></i> and <i>C<sub>SHGC</sub></i> — climate-zone constants, weighted between slab-on-ground and suspended floor by their share of the floor area, and adjusted for air movement.</p><p><b>The tension is deliberate.</b> Winter rewards a high SHGC and a low U; summer punishes a high SHGC. Shading is what separates them, because an eave cuts the summer sun far more than the winter sun — which is why P/H, rather than the glass alone, usually decides whether a design complies. The optimiser below solves both constraints at once against the WERS library and returns the highest average U-Value that still passes, i.e. the least expensive compliant glazing.</p><p><b>Read the headroom, not just the pass.</b> Each result is reported as a figure against its allowance with the margin between them. A design sitting a few per cent under the limit will not survive a window substitution without reassessment.</p>";
+  /* Two calculators, deliberately separate. The first answers "what do I
+     need?" and never reads the proposed windows. The second answers "does
+     what has been drawn comply?" and never writes to them. */
+  gz.title = "6 · 13.3 External glazing — REQUIRED specification";
   gz.calcs = [
-    {id:"C_GZ1",l:"Winter outcome — CU/CSHGC ratio vs allowance (13.3.2, CZ2–8)",fn:"calc_gzWinter"},
-    {id:"C_GZ2",l:"Summer outcome — SHGC load vs allowance (13.3.3, CZ1–7)",fn:"calc_gzSummer"},
-    {id:"C_GZ3",l:"Optimised WERS specification (max U) — writes U/SHGC into schedule",fn:"calc_gzOptimise"}
+    {id:"C_GZ3",l:"Required specification — cheapest WERS windows that comply (13.3.2 + 13.3.3)",fn:"calc_gzOptimise"}
   ];
+  const gzp = {
+    id:"GZP", pg:"h6", title:"6b · 13.3 External glazing — compliance AS PROPOSED",
+    rpt:"13.3", rsec:"2.4", grp:gz.grp, linked:["G3","G9","G10"], collRef:"GZ", params:[],
+    intro:"<p>The section above says what the glazing <b>needs</b> to be. This one checks what has "
+      +"actually been specified in the schedule — the U-Value and SHGC columns — against the same two "
+      +"tests. Nothing here is written by the optimiser, so a pass here is a real pass.</p>"
+      +"<p>While no windows have been chosen yet, mark this section <b>N/A</b>. It will report the gap "
+      +"the moment values are entered.</p>",
+    calcs:[
+      {id:"C_GZ1",l:"Winter outcome as proposed — CU/CSHGC ratio vs allowance (13.3.2, CZ2–8)",fn:"calc_gzWinter"},
+      {id:"C_GZ2",l:"Summer outcome as proposed — SHGC load vs allowance (13.3.3, CZ1–7)",fn:"calc_gzSummer"}
+    ]
+  };
+  if(!SEC.some(s=>s.id==="GZP")) SEC.splice(SEC.indexOf(gz)+1, 0, gzp);
   if(!S.coll.gl) S.coll.gl=[];
 })();
 
@@ -3591,15 +3726,32 @@ function gzRow(uid){
   return {ok:true,uid,V,Kc:V*kap,Wc:V*Ew*om,Sc:V*Es*sig,
           u:parseFloat(g("u"))||0, shgc:parseFloat(g("shgc"))||0, open:g("open")||""};
 }
-function gzEval(){
+/* The required specification the optimiser last produced, keyed by opening
+   type, so it can be evaluated without touching the proposed windows. */
+function gzRequiredMap(){
+  const m={};
+  for(const k of Object.keys(S.vals)){
+    const p=k.match(/^GZR\.(.+)\.(u|shgc)$/); if(!p) continue;
+    (m[p[1]]=m[p[1]]||{})[p[2]]=Number(S.vals[k].v);
+  }
+  return Object.keys(m).length? m : null;
+}
+function gzHasProposed(){
+  for(const uid of (S.coll.gl||[])){
+    if(Number(getV("c.gl."+uid+".u"))>0 && Number(getV("c.gl."+uid+".shgc"))>0) return true;
+  }
+  return false;
+}
+function gzEval(byType){
   const alw=gzAllow(); if(!alw) return {err:"Enter the climate zone (G3), and either the total conditioned floor area (G10) or the glazing floor-area split (GZ1–GZ3), before calculating."};
   const agg={cond:0,wgain:0,sgain:0}; let rows=0, incomplete=0;
   for(const uid of S.coll.gl){
     const e=gzRow(uid); if(!e.ok) continue;
     rows++;
-    if(e.u<=0||e.shgc<=0){ incomplete++; continue; }
-    const sh=Math.min(e.shgc,0.7);
-    agg.cond+=e.Kc*e.u; agg.wgain+=e.Wc*sh; agg.sgain+=e.Sc*sh;
+    const spec = byType ? (byType[e.open]||null) : {u:e.u, shgc:e.shgc};
+    if(!spec || !(spec.u>0) || !(spec.shgc>0)){ incomplete++; continue; }
+    const sh=Math.min(spec.shgc,0.7);
+    agg.cond+=e.Kc*spec.u; agg.wgain+=e.Wc*sh; agg.sgain+=e.Sc*sh;
   }
   if(!rows) return {err:"No valid glazing rows (need sector + size)."};
   const z=gzZone();
@@ -3649,7 +3801,9 @@ function gzReport(){
     schedule:sched,
     products: pick ? Object.keys(pick).map(g=>({type:g, id:pick[g].id, glazing:pick[g].glz,
                                                 frame:pick[g].mat, u:pick[g].u, shgc:pick[g].shgc})) : [],
-    frameFilter:String(getV("GZ6")||"Any")
+    frameFilter:String(getV("GZ6")||"Any"),
+    required: gzRequiredMap(),          /* what the glazing must achieve */
+    proposedEntered: gzHasProposed()    /* whether anything has been chosen yet */
   };
   if(r.winter) out.winter={figure:Math.round(r.winter.ratio*1000)/1000, allowance:r.winter.limit,
       pass:r.winter.pass, headroom:Math.round((r.winter.limit-r.winter.ratio)*1000)/1000,
@@ -3665,6 +3819,8 @@ function gzReport(){
 }
 
 CALC.calc_gzWinter = function(){
+  if(isNA("GZP")) return {v:"n/a",cls:"ok",note:"Proposed glazing not yet specified"+(naReason("GZP")?" — "+naReason("GZP"):".")};
+  if(!gzHasProposed()) return {v:"",cls:"err",note:"No opening in the schedule carries both a U-Value and an SHGC yet. Enter the proposed windows, or mark this section not applicable until they are chosen. The REQUIRED specification is produced separately, above."};
   const r=gzEval(); if(r.err) return {v:"",cls:"err",note:r.err};
   window.__gzLast=r; setTimeout(drawGzCharts,50);
   if(!r.winter) return {v:"n/a",cls:"ok",note:"Climate zone 1 — 13.3.2 sets no winter requirement. Only the summer test at 13.3.3 applies."};
@@ -3676,6 +3832,8 @@ CALC.calc_gzWinter = function(){
           note:"WINTER — 13.3.2. Aggregate conductance ÷ aggregate winter solar gain = Σcond "+r.agg.cond.toFixed(1)+" ÷ Σwinter gain "+r.agg.wgain.toFixed(1)+" = "+r.winter.ratio.toFixed(3)+", against an allowance of "+r.winter.limit.toFixed(1)+".\n"+(r.winter.pass? "Complies, with "+(r.winter.limit-r.winter.ratio).toFixed(2)+" of headroom." : "Exceeds by "+(r.winter.ratio-r.winter.limit).toFixed(2)+". Levers: lower-U glazing, more north-facing glass, or less shading to north windows.")+inc+gzAreaNote()};
 };
 CALC.calc_gzSummer = function(){
+  if(isNA("GZP")) return {v:"n/a",cls:"ok",note:"Proposed glazing not yet specified"+(naReason("GZP")?" — "+naReason("GZP"):".")};
+  if(!gzHasProposed()) return {v:"",cls:"err",note:"No opening in the schedule carries both a U-Value and an SHGC yet. Enter the proposed windows, or mark this section not applicable until they are chosen."};
   const r=gzEval(); if(r.err) return {v:"",cls:"err",note:r.err};
   window.__gzLast=r; setTimeout(drawGzCharts,50);
   if(!r.summer) return {v:"n/a",cls:"ok",note:"Climate zone 8 — 13.3.3 sets no summer requirement. Only the winter test at 13.3.2 applies."};
@@ -3694,9 +3852,8 @@ CALC.calc_gzOptimise = function(){
   const groups={}, locked={cond:0,wgain:0,sgain:0}, lockedRows=[]; let any=false, missing=[];
   for(const uid of S.coll.gl){
     const e=gzRow(uid); if(!e.ok) continue; any=true;
-    const uSt=getSt("c.gl."+uid+".u"), sSt=getSt("c.gl."+uid+".shgc");
-    const manual=["assum","doc","conf"].includes(uSt)&&["assum","doc","conf"].includes(sSt)&&e.u>0&&e.shgc>0;
-    if(manual){ const sh=Math.min(e.shgc,0.7); locked.cond+=e.Kc*e.u; locked.wgain+=e.Wc*sh; locked.sgain+=e.Sc*sh; lockedRows.push(uid); continue; }
+    /* every opening is optimised: this is the required specification, and
+       what happens to be drawn must not constrain it */
     if(!e.open){ missing.push(getV("c.gl."+uid+".tag")||uid); continue; }
     (groups[e.open]=groups[e.open]||{uids:[],K:0,W:0,Sg:0,A:0});
     const g=groups[e.open]; g.uids.push(uid); g.K+=e.Kc; g.W+=e.Wc; g.Sg+=e.Sc; g.A+=e.V;
@@ -3764,15 +3921,22 @@ CALC.calc_gzOptimise = function(){
     +(lockedRows.length? "\nRows held at their confirmed specification and excluded from the search: "+lockedRows.length : "")};
   const feas=beam.filter(s=>Lw===Infinity||(s.WS>0&&s.KU/s.WS<=Lw+1e-9));
   const sol=feas.length?feas[0]:beam.reduce((a,b)=>(a.KU/Math.max(a.WS,1e-9)<b.KU/Math.max(b.WS,1e-9)?a:b));
-  for(const [g,c] of Object.entries(sol.pick)) for(const uid of groups[g].uids){
-    setV("c.gl."+uid+".u",c.u,"calc"); setV("c.gl."+uid+".shgc",c.shgc,"calc");
+  /* REQUIRED spec, stored per opening type under its own keys. It must not
+     land in the schedule: those cells are the PROPOSED windows, and the
+     compliance section reads them. Overwriting them made the check grade
+     the optimiser's own answer, so it could never fail. */
+  for(const k of Object.keys(S.vals)) if(k.indexOf("GZR.")===0) dropV(k);
+  for(const [g,c] of Object.entries(sol.pick)){
+    setV("GZR."+g+".u", c.u, "calc");
+    setV("GZR."+g+".shgc", c.shgc, "calc");
+    setV("GZR."+g+".id", c.id, "calc");
   }
   window.__gzSpec={pick:sol.pick, groups, lockedRows, feasible:feas.length>0};
-  const r=gzEval(); window.__gzLast=r; setTimeout(()=>{drawGzCharts();},80);
+  const r=gzEval(gzRequiredMap()); window.__gzLast=r; setTimeout(()=>{drawGzCharts();},80);
   const desc=Object.entries(sol.pick).map(([g,c])=>g+": "+c.id+" (U "+c.u.toFixed(1)+" / SHGC "+c.shgc.toFixed(2)+")").join("\n");
   if(!feas.length) return {v:"closest (infeasible)",cls:"err",
     note:"No WERS combination passes BOTH tests with the current shading and orientations. The closest has been written in for reference:\n"+desc+(lockedRows.length? "\nRows held at their confirmed specification: "+lockedRows.length : "")+(_fmMissed.length? "\nNo "+_fm+" product serves "+_fmMissed.join(", ")+" — any frame was used for those." : "")+"\nLevers: reduce shading to north glazing (winter), add external devices east and west (summer), or specify lower-U products."};
-  return {v:"optimised — see schedule",cls:"ok",
+  return {v:"required spec — see below",cls:"ok",
     note:"Highest average U-Value — so the least expensive glazing — that still satisfies both tests. One product per opening type:\n"+desc+(lockedRows.length?"\nRows held at their confirmed specification and excluded from the search: "+lockedRows.length:"")+(_fmMissed.length? "\nNo "+_fm+" product serves "+_fmMissed.join(", ")+" — any frame was used for those." : "")+"\nWinter "+(r.winter?(r.winter.ratio.toFixed(2)+" ≤ "+r.winter.limit.toFixed(1)):"n/a")+" | Summer "+(r.summer?(r.summer.load.toFixed(2)+" ≤ "+r.summer.limit.toFixed(1)):"n/a")};
 };
 
@@ -3834,7 +3998,7 @@ p13Render();
 <script>
 /* ==================== SUITE SHELL ==================== */
 /* build stamp — compare this between devices before blaming the sync */
-const SUITE_BUILD = "2026-08-03 09:35";
+const SUITE_BUILD = "2026-08-03 10:47";
 const SUITE_BUILD_NOTE = " · build " + SUITE_BUILD;
 /* ============================================================================
    SUITE SHELL — owns the store, the project selector, the two-level nav, and
@@ -4202,6 +4366,9 @@ function suiteGsyncInit(){
   SUITE.paint();
   save();
   suiteGsyncInit();
+  /* a template dropped into the Drive folder by hand should just appear;
+     Drive needs a moment to connect first, and this must never block boot */
+  setTimeout(()=>{ try{ if(typeof adoptAllTemplates==="function") adoptAllTemplates(); }catch(e){} }, 5000);
 })();
 
 </script>
