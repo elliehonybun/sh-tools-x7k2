@@ -3120,11 +3120,13 @@ function h6Fields(){
   put("assume_floor", getV("F1"), "floor type (F1)");
 
   /* --- services ------------------------------------------------------ */
-  const svc=(k,stars)=>{ const v=getV(k); if(!v) return null;
-    const s=stars? getV(stars) : null; return s? v+" — "+s+"★" : v; };
-  put("svc_heating", svc("WH1","WH1s"), "main heating (WH1)");
-  put("svc_cooling", svc("WH2","WH2s"), "main cooling (WH2)");
-  put("svc_hws", getV("WH3"), "hot water (WH3)");
+  /* The appliance categories moved to the Whole of Home page and carry
+     their star band inside the category, so there is no separate rating
+     to append any more. Reading the old keys returned nothing and the
+     services schedule came out blank. */
+  put("svc_heating", getV("H6H"), "main heater (H6H, Whole of Home page)");
+  put("svc_cooling", getV("H6C"), "main cooler (H6C, Whole of Home page)");
+  put("svc_hws", getV("H6W"), "main water heater (H6W, Whole of Home page)");
   put("svc_cooktop", getV("WH6a"), "cooktop (WH6a)");
   put("svc_oven", getV("WH6b"), "oven (WH6b)");
   const pv=getV("WH8a")==="installed"? getV("WH8") : null;
@@ -3133,8 +3135,14 @@ function h6Fields(){
   F["cooling_cap"]="Clause 55/58 planning cooling-load cap ≤ 22 MJ/m²·yr, where applicable";
 
   /* --- whole of home -------------------------------------------------- */
-  const woh=h6Calc("C_WH6"), A=h6Calc("C_WH1"), EF=h6Calc("C_WH3");
-  const net=String(woh.note||"").match(/net\s*([\d.]+)/i);
+  /* C_WH4 is the compliance result; C_WH_EF is the energy factor.
+     C_WH6 does not exist and C_WH3 is the SPA pump — reading those gave
+     an empty Whole-of-Home line on every report. */
+  const woh=h6Calc("C_WH4"), A=h6Calc("C_WH1"), EF=h6Calc("C_WH_EF");
+  /* net usage can legitimately be NEGATIVE — a PV array larger than the
+     dwelling uses offsets past zero — so the sign has to be captured too */
+  const net=String(woh.note||"").match(/=\s*(-?[\d.]+)\s*\nAllowance/i)
+           || String(woh.note||"").match(/net\s*(-?[\d.]+)/i);
   if(net) F["woh_net"]=net[1]; else gap("woh_net","net equivalent energy usage (C_WH6)");
   if(A.v && EF.v){ const a=Number(A.v), ef=Number(EF.v);
     if(isFinite(a)&&isFinite(ef)) F["woh_allowance"]=h6Num(a*ef,2); }
@@ -3214,7 +3222,7 @@ function h6Fields(){
                  return !s || s==="x" || s.indexOf("not permitted")>=0; };
   const thermalOK = !bad(ceil.v) && !bad(h6Calc("C_EW1").v) && G && G.complies===true;
   F["status_thermal"]= thermalOK? "COMPLIES" : "NOT YET DEMONSTRATED";
-  F["status_woh"]= (woh.v && !bad(woh.v) && !/fail|exceed/i.test(String(woh.v)))
+  F["status_woh"]= (woh.v && !bad(woh.v) && /^PASS/i.test(String(woh.v)))
                    ? "COMPLIES" : "NOT YET DEMONSTRATED";
 
   return {map:F, lists:L, gaps:gaps};
@@ -4209,7 +4217,7 @@ p13Render();
 <script>
 /* ==================== SUITE SHELL ==================== */
 /* build stamp — compare this between devices before blaming the sync */
-const SUITE_BUILD = "2026-08-03 15:18";
+const SUITE_BUILD = "2026-08-03 17:02";
 const SUITE_BUILD_NOTE = " · build " + SUITE_BUILD;
 /* ============================================================================
    SUITE SHELL — owns the store, the project selector, the two-level nav, and
