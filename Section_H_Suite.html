@@ -1596,7 +1596,10 @@ function p13EnsureShape(){ if(!S.coll) S.coll={};
      must not need this list edited too */
   const need=["rl","gl","rooms","lts","walls"];
   try{ for(const sec of SEC) if(sec.coll&&sec.coll.id) need.push(sec.coll.id); }catch(e){}
-  for(const k of need){ if(!Array.isArray(S.coll[k])) S.coll[k]=[]; } if(!S.page) S.page="project"; if(!("eePack" in S)) S.eePack=null; if(!S.seq) S.seq=1; }
+  for(const k of need){ if(!Array.isArray(S.coll[k])) S.coll[k]=[]; }
+  if(!S.page) S.page="project"; if(!("eePack" in S)) S.eePack=null; if(!S.seq) S.seq=1;
+  if(!S.valTombs) S.valTombs={}; if(!S.collTombs) S.collTombs={};
+}
 
 /* ------------------------------------------------------------------
    STORE — owned by the suite shell. `S` is a live pointer into the
@@ -1619,7 +1622,17 @@ function syncMirrors(key,val,src){
 
 function getV(k){ const c=S.vals[k]; return (c && c.v!=="" && c.v!=null) ? c.v : null; }
 function getSt(k){ return (S.vals[k]&&S.vals[k].st)||"none"; }
-function setV(k,v,st){ if(v===""||v==null){ delete S.vals[k]; } else { S.vals[k]={v:v,st:st}; } p13Save(); }
+/* Every cell carries its own `at`. Without it the whole p13 block had to
+   merge as one record, so a single newer block on Drive replaced every
+   value typed here — the reported data loss. */
+function p13Now(){ return new Date().toISOString(); }
+function p13Tomb(k){ if(!S.valTombs) S.valTombs={}; S.valTombs[k]=p13Now(); }
+function dropV(k){ if(S.vals[k]!==undefined){ delete S.vals[k]; p13Tomb(k); } }
+function setV(k,v,st){
+  if(v===""||v==null){ dropV(k); }
+  else { S.vals[k]={v:v,st:st,at:p13Now()}; if(S.valTombs) delete S.valTombs[k]; }
+  p13Save();
+}
 
 /* ============================================================
    SECTION DEFINITIONS (readable params)
@@ -3126,15 +3139,21 @@ document.addEventListener("focusout",e=>{
 });
 
 function confirmKey(k){ if(["doc","assum"].includes(getSt(k))){ S.vals[k].st="conf"; p13Save(); p13Render(); } }
-function clearKey(k){ delete S.vals[k]; p13Save(); p13Render(); }
+function clearKey(k){ dropV(k); p13Save(); p13Render(); }
 function confirmRow(collId,uid){
   for(const key of Object.keys(S.vals)){ if(key.startsWith("c."+collId+"."+uid+".") && ["doc","assum"].includes(S.vals[key].st)) S.vals[key].st="conf"; }
   p13Save(); p13Render();
 }
-function addRow(collId){ S.coll[collId].push(String(S.seq++)); p13Save(); p13Render(); }
+/* A per-device counter gave the desktop and the iPad the same "1" for
+   different rows; on merge the rows AND their cell keys collided. */
+function p13Uid(){
+  if(window.GSync && GSync.newId) return GSync.newId();
+  return Date.now().toString(36)+"-"+Math.random().toString(36).slice(2,8);
+}
+function addRow(collId){ S.coll[collId].push(p13Uid()); p13Save(); p13Render(); }
 function splitGlRow(uid){
   const gz=SEC.find(x=>x.id==="GZ"); const flds=gz.coll.fields.map(f=>f.f);
-  const nuid=String(S.seq++);
+  const nuid=p13Uid();
   const i=S.coll.gl.indexOf(uid); S.coll.gl.splice(i+1,0,nuid);
   for(const f of flds){
     if(["h","w","area","u","shgc"].includes(f)) continue; // sizes/specs entered manually per split
@@ -3157,12 +3176,17 @@ function exportWindowsCSV(){
   const a=document.createElement("a"); a.href=URL.createObjectURL(blob);
   a.download=(pj?pj+"_":"")+"window_schedule.csv"; a.click();
 }
-function delRow(collId,uid){ S.coll[collId]=S.coll[collId].filter(x=>x!==uid);
-  for(const key of Object.keys(S.vals)){ if(key.startsWith("c."+collId+"."+uid+".")) delete S.vals[key]; } p13Save(); p13Render(); }
+function delRow(collId,uid){
+  S.coll[collId]=S.coll[collId].filter(x=>x!==uid);
+  if(!S.collTombs) S.collTombs={};
+  S.collTombs[collId+"."+uid]=p13Now();   /* or the other device restores it */
+  for(const key of Object.keys(S.vals)){ if(key.startsWith("c."+collId+"."+uid+".")) dropV(key); }
+  p13Save(); p13Render();
+}
 
 function runCalc(key,fn){
   const r=CALC[fn]();
-  if(r.v!=="" && r.v!=null && !r.cls.includes("err")) setV(key,r.v,"calc"); else if(r.cls==="err") delete S.vals[key];
+  if(r.v!=="" && r.v!=null && !r.cls.includes("err")) setV(key,r.v,"calc"); else if(r.cls==="err") dropV(key);
   p13Save(); p13Render();
   const noteEl=document.getElementById("note-"+key);
   if(noteEl){ noteEl.textContent=r.note||""; noteEl.className="cnote "+(r.cls||""); }
@@ -3810,7 +3834,7 @@ p13Render();
 <script>
 /* ==================== SUITE SHELL ==================== */
 /* build stamp — compare this between devices before blaming the sync */
-const SUITE_BUILD = "2026-08-03 09:03";
+const SUITE_BUILD = "2026-08-03 09:35";
 const SUITE_BUILD_NOTE = " · build " + SUITE_BUILD;
 /* ============================================================================
    SUITE SHELL — owns the store, the project selector, the two-level nav, and
@@ -4028,6 +4052,74 @@ function suiteMigrate(){
 /* ============================================================================
    SYNC — one Drive file for the whole suite
    ========================================================================== */
+
+/* ---------------------------------------------------------------------------
+   suiteMergeP13 — merge two Part 13 blocks value by value.
+
+   Taking the whole block on a timestamp is what lost Ellie's data: one newer
+   block on Drive replaced everything typed here. Each cell now carries its own
+   `at` and is decided on its own, exactly the way projects and costs already
+   merge one level up.
+
+   A cell written before this build has no `at`; it inherits its block's
+   updatedAt, which is the most that can honestly be said about when it was
+   written. Ties go to local — the device in front of you is the one whose work
+   is unsaved elsewhere.
+   ------------------------------------------------------------------------- */
+function suiteMergeP13(lp, rp){
+  if(!lp) return rp; if(!rp) return lp;
+  const T0=s=>GSync.ts(s), lBase=T0(lp.updatedAt), rBase=T0(rp.updatedAt);
+  const at=(blk,base,k)=>{ const c=blk.vals&&blk.vals[k]; return c&&c.at? T0(c.at) : base; };
+
+  const out=Object.assign({}, T0(rp.updatedAt)>T0(lp.updatedAt) ? rp : lp);
+  out.vals={}; out.coll={}; out.valTombs={}; out.collTombs={};
+
+  /* ---- deletions first: a tombstone only wins if it postdates the value --- */
+  const vt=Object.assign({}, lp.valTombs||{}, rp.valTombs||{});
+  for(const k of Object.keys(rp.valTombs||{})){
+    const l=(lp.valTombs||{})[k];
+    if(l && T0(l)>T0(rp.valTombs[k])) vt[k]=l;
+  }
+  const ct=Object.assign({}, lp.collTombs||{}, rp.collTombs||{});
+  for(const k of Object.keys(rp.collTombs||{})){
+    const l=(lp.collTombs||{})[k];
+    if(l && T0(l)>T0(rp.collTombs[k])) ct[k]=l;
+  }
+
+  /* ---- values ------------------------------------------------------------ */
+  const keys=new Set([...Object.keys(lp.vals||{}), ...Object.keys(rp.vals||{})]);
+  for(const k of keys){
+    const lc=(lp.vals||{})[k], rc=(rp.vals||{})[k];
+    const lAt=lc? at(lp,lBase,k) : -1, rAt=rc? at(rp,rBase,k) : -1;
+    const win = (lc&&rc) ? (rAt>lAt ? rc : lc) : (lc||rc);
+    const winAt = (win===rc) ? rAt : lAt;
+    if(vt[k] && T0(vt[k])>=winAt) continue;      /* deleted after it was written */
+    out.vals[k]=win;
+  }
+
+  /* ---- schedule rows: union, minus anything tombstoned, local order first - */
+  const cids=new Set([...Object.keys(lp.coll||{}), ...Object.keys(rp.coll||{})]);
+  for(const cid of cids){
+    const l=(lp.coll||{})[cid]||[], r=(rp.coll||{})[cid]||[];
+    const seen=new Set(), rows=[];
+    for(const uid of l.concat(r)){
+      if(seen.has(uid)) continue; seen.add(uid);
+      if(ct[cid+"."+uid]) continue;
+      rows.push(uid);
+    }
+    out.coll[cid]=rows;
+  }
+
+  /* ---- tombstones travel, but do not accumulate forever ------------------ */
+  const cutoff=Date.now()-180*24*3600*1000;
+  for(const k of Object.keys(vt)) if(T0(vt[k])>cutoff) out.valTombs[k]=vt[k];
+  for(const k of Object.keys(ct)) if(T0(ct[k])>cutoff) out.collTombs[k]=ct[k];
+
+  out.seq=Math.max(Number(lp.seq)||1, Number(rp.seq)||1);
+  out.updatedAt = T0(rp.updatedAt)>T0(lp.updatedAt) ? rp.updatedAt : lp.updatedAt;
+  return out;
+}
+
 function suiteMergeProjects(localArr, remoteArr, localTombs, remoteTombs){
   /* tracker fields and the p13 block carry separate stamps and merge separately */
   const L={}, R={};
@@ -4040,9 +4132,7 @@ function suiteMergeProjects(localArr, remoteArr, localTombs, remoteTombs){
   const out={};
   for(const [id,rec] of Object.entries(base.map)){
     const lp=L[id]&&L[id].p13, rp=R[id]&&R[id].p13;
-    let p13=lp;
-    if(lp&&rp) p13 = GSync.ts(rp.updatedAt)>GSync.ts(lp.updatedAt) ? rp : lp;
-    else p13 = lp||rp;
+    const p13 = (lp&&rp) ? suiteMergeP13(lp,rp) : (lp||rp);
     const merged=Object.assign({},rec);
     if(p13) merged.p13=p13; else delete merged.p13;
     out[id]=merged;
