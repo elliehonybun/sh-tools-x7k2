@@ -1131,7 +1131,18 @@ function updateCounts(){
     +'<span class="pill grey">'+done+' complete</span>'
     +'<span class="pill purple">'+money(pipeline)+' pipeline ex GST</span>';
 }
-function render(){
+function render(){ try{ return _render(); }
+  catch(err){
+    const el=document.getElementById("app");
+    if(el) el.innerHTML='<div class="banner" style="background:#fef2f2;border-color:#fecaca;'
+      +'color:#991b1b"><b>This page could not be drawn.</b><br>'
+      +String(err&&err.message||err).replace(/</g,"&lt;")
+      +'<div style="font-size:11px;margin-top:6px">Your data is not affected — it is saved. '
+      +'Send this message on and it can be fixed; press F12 for the full detail.</div></div>';
+    throw err;
+  }
+}
+function _render(){
   document.getElementById("fyLbl").textContent=fyStartISO().slice(0,4)+"/"+fyEndISO().slice(2,4);
   document.getElementById("pagenav").innerHTML=PAGES.map(([id,l])=>'<button data-tab="'+id+'" class="'+(T.page===id?"active":"")+'" onclick="setPage(\''+id+'\')">'+l+'</button>').join("");
   const app=document.getElementById("app");
@@ -2705,6 +2716,7 @@ function inputHTML(key,p){
   return '<input type="'+typ+'" step="any" data-key="'+key+'"'
     +(p.ro?' disabled title="Derived — press Apply totals on the room schedule"':'')
     +(p.ti?' title="'+String(p.ti).replace(/"/g,"&quot;")+'"':'')
+    +(p.w?' style="min-width:'+p.w+'"':'')
     +' value="'+(v==null?"":String(v).replace(/"/g,"&quot;"))+'">';
 }
 
@@ -3124,6 +3136,13 @@ function p13Render(){
   if(naHere.length) h='<div class="na-summary"><b>'+naHere.length+' provision'+(naHere.length===1?"":"s")
     +' excluded from this assessment</b>'+naHere.map(s=>'<span>'+(s.rpt?s.rpt+" ":"")+suiteEsc(s.title)
     +(naReason(s.id)?" — "+suiteEsc(naReason(s.id)):"")+'</span>').join("")+'</div>'+h;
+  if(S.page==="h6"||S.page==="woh"||S.page==="summary"){
+    h+='<div style="margin:18px 0 6px;text-align:right">'
+      +'<button class="cbtn" onclick="generateH6Report()">Generate H6 report (.docx)</button>'
+      +'<div style="font-size:11px;color:var(--muted);margin-top:4px">'
+      +'Recalculates everything first — anything it cannot fill is named after the download.'
+      +'</div></div>';
+  }
   app.innerHTML=h;
   p13UpdateCounts();
   renderSlots();
@@ -3583,7 +3602,7 @@ const GD = {"Projections": [0, 0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 1, 1.2, 1.4, 1.6, 
   gz.title = "6 · 13.3 External glazing — integrated NCC calculator + WERS optimiser";
   gz.linked = ["G3","G9","G10","F1"];
   gz.coll = {id:"gl", label:"Glazing schedule (NCC calculator matrix — scrape from window schedule PDFs)", fields:[
-    {f:"tag",l:"ID",t:"text"},
+    {f:"tag",l:"ID",t:"text",w:"6.5em"},
     {f:"sector",l:"Sector",t:"sel",o:GD.Directions},
     {f:"h",l:"Ht m",t:"num"},{f:"w",l:"Wd m",t:"num"},{f:"area",l:"Area m²",t:"num"},
     {f:"room",l:"Room",t:"sel",o:GD.RoomTypes},
@@ -3998,7 +4017,7 @@ p13Render();
 <script>
 /* ==================== SUITE SHELL ==================== */
 /* build stamp — compare this between devices before blaming the sync */
-const SUITE_BUILD = "2026-08-03 10:47";
+const SUITE_BUILD = "2026-08-03 11:03";
 const SUITE_BUILD_NOTE = " · build " + SUITE_BUILD;
 /* ============================================================================
    SUITE SHELL — owns the store, the project selector, the two-level nav, and
