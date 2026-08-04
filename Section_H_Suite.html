@@ -1428,21 +1428,77 @@ function expandEachRows(xml, lists){
   });
 }
 
-async function fillDocx(b64, map, lists){
+/* ---- .docx picture swapping ---------------------------------------------
+   Ellie's template already carries both charts: example images placed where
+   they belong, with the surrounding paragraphs written around them. So the
+   generator replaces the picture's BYTES rather than inserting a new drawing —
+   the position, size, wrapping, caption and numbering all survive untouched,
+   and the template needs no re-cutting.
+
+   The two pictures are found by the name on their <wp:docPr>, which the
+   template cutter sets to chart_glazing / chart_woh. Name, not relationship
+   id: Word renumbers rIds whenever it feels like it, and a picture identified
+   by position stops being the right picture the first time a paragraph moves.
+
+   The drawing's own extent is rewritten to the chart's aspect ratio, keeping
+   the template's width. Reusing the example image's height would squash a
+   chart of a different shape, and a squashed chart is a chart nobody trusts.
+   -------------------------------------------------------------------------- */
+async function swapDocxPictures(zip, partName, xml, images, swapped){
+  const relName=partName.replace(/^word\/(.*)$/, "word/_rels/$1.rels");
+  const relFile=zip.file(relName);
+  if(!relFile) return xml;
+  const rels=await relFile.async("string");
+  const target={};                       /* rId -> media path */
+  const rre=/Id="([^"]+)"[^>]*Target="([^"]+)"/g; let rm;
+  while((rm=rre.exec(rels))!==null) target[rm[1]]=rm[2];
+
+  let out=xml, moved=false;
+  const dre=/<w:drawing>[\s\S]*?<\/w:drawing>|<w:pict>[\s\S]*?<\/w:pict>/g;
+  const hits=[]; let dm;
+  while((dm=dre.exec(xml))!==null) hits.push({s:dm.index,e:dre.lastIndex,x:dm[0]});
+
+  for(let i=hits.length-1;i>=0;i--){      /* right to left keeps offsets valid */
+    const d=hits[i].x;
+    const nm=d.match(/<wp:docPr\b[^>]*\bname="([^"]*)"/);
+    const key=nm && nm[1] && nm[1].trim().toLowerCase().replace(/^chart[_ -]?/,"");
+    const img=key && (images["chart_"+key] || images[key]);
+    if(!img || !img.dataURL) continue;
+    const rid=d.match(/r:embed="([^"]+)"/);
+    if(!rid || !target[rid[1]]) continue;
+
+    const path="word/"+target[rid[1]].replace(/^\/?/,"").replace(/^word\//,"");
+    zip.file(path, img.dataURL.split(",")[1], {base64:true});
+
+    /* keep the template's width, take the chart's aspect */
+    let nd=d.replace(/(<wp:extent\s+cx=")(\d+)("\s+cy=")(\d+)(")/,
+      (m0,a,cx,b,cy,c)=>a+cx+b+Math.round(Number(cx)*img.h/img.w)+c);
+    nd=nd.replace(/(<a:ext\s+cx=")(\d+)("\s+cy=")(\d+)(")/,
+      (m0,a,cx,b,cy,c)=>a+cx+b+Math.round(Number(cx)*img.h/img.w)+c);
+    out=out.slice(0,hits[i].s)+nd+out.slice(hits[i].e);
+    moved=true;
+    if(swapped && swapped.indexOf(key)<0) swapped.push(key);
+  }
+  if(moved) return out;
+  return xml;
+}
+
+async function fillDocx(b64, map, lists, images){
   if(typeof JSZip==="undefined") throw new Error("The document library didn't load — check your internet connection and reload.");
   const zip=await JSZip.loadAsync(b64,{base64:true});
   const parts=Object.keys(zip.files).filter(n=>/^word\/(document|header\d*|footer\d*)\.xml$/.test(n));
   if(!parts.length) throw new Error("That doesn't look like a Word .docx file.");
-  const missing=new Set();
+  const missing=new Set(), swapped=[];
   for(const n of parts){
     let xml=await zip.file(n).async("string");
     if(lists) xml=expandEachRows(xml, lists);
+    if(images) xml=await swapDocxPictures(zip, n, xml, images, swapped);
     zip.file(n, fillDocxXml(xml, map, missing));
   }
   /* DEFLATE, or the .docx comes out ~20x larger than the template it came from */
   const blob=await zip.generateAsync({type:"blob", compression:"DEFLATE", compressionOptions:{level:6},
     mimeType:"application/vnd.openxmlformats-officedocument.wordprocessingml.document"});
-  return {blob, missing:[...missing]};
+  return {blob, missing:[...missing], charts:swapped};
 }
 
 
@@ -3135,16 +3191,17 @@ function h6Fields(){
   F["cooling_cap"]="Clause 55/58 planning cooling-load cap ≤ 22 MJ/m²·yr, where applicable";
 
   /* --- whole of home -------------------------------------------------- */
-  /* C_WH4 is the compliance result; C_WH_EF is the energy factor.
-     C_WH6 does not exist and C_WH3 is the SPA pump — reading those gave
-     an empty Whole-of-Home line on every report. */
+  /* Round 19: wohReport() returns the figures themselves. Round 18 had to
+     recover the net usage with a regex over the calc's prose note, which
+     worked only for as long as nobody reworded the note. */
+  const WR=(typeof wohReport==="function")? wohReport() : null;
   const woh=h6Calc("C_WH4"), A=h6Calc("C_WH1"), EF=h6Calc("C_WH_EF");
-  /* net usage can legitimately be NEGATIVE — a PV array larger than the
-     dwelling uses offsets past zero — so the sign has to be captured too */
-  const net=String(woh.note||"").match(/=\s*(-?[\d.]+)\s*\nAllowance/i)
-           || String(woh.note||"").match(/net\s*(-?[\d.]+)/i);
+  const net=(WR && !WR.blocked && WR.applicable)? [null, String(WR.figure)]
+    : (String(woh.note||"").match(/=\s*(-?[\d.]+)\s*\nAllowance/i)
+       || String(woh.note||"").match(/net\s*(-?[\d.]+)/i));
   if(net) F["woh_net"]=net[1]; else gap("woh_net","net equivalent energy usage (C_WH6)");
-  if(A.v && EF.v){ const a=Number(A.v), ef=Number(EF.v);
+  if(WR && !WR.blocked && WR.applicable) F["woh_allowance"]=h6Num(WR.allowance,2);
+  else if(A.v && EF.v){ const a=Number(A.v), ef=Number(EF.v);
     if(isFinite(a)&&isFinite(ef)) F["woh_allowance"]=h6Num(a*ef,2); }
   if(!F["woh_allowance"]) gap("woh_allowance","Whole-of-Home allowance (needs C_WH1 and C_WH3)");
 
@@ -3225,6 +3282,27 @@ function h6Fields(){
   F["status_woh"]= (woh.v && !bad(woh.v) && /^PASS/i.test(String(woh.v)))
                    ? "COMPLIES" : "NOT YET DEMONSTRATED";
 
+
+  /* --- chart captions ------------------------------------------------
+     The template prints "Example values shown." beside each chart, which is
+     honest in a template and false in an issued report. Once the chart carries
+     this project's figures the caption has to say so. */
+  const GC=(typeof gzChartSpec==="function")? gzChartSpec() : {blocked:"unavailable"};
+  const WC=(typeof wohChartSpec==="function")? wohChartSpec() : {blocked:"unavailable"};
+  const site=getV("G1")||"this dwelling";
+  if(GC && !GC.blocked && GC.report){
+    const w=GC.report.winter, s=GC.report.summer;
+    F["chart_note_glazing"]="Computed for "+site+" from the window schedule in this report — "
+      +(w? ("winter "+h6Num(w.figure,2)+" against "+h6Num(w.allowance,2)) : "winter not applicable")
+      +", "+(s? ("summer "+h6Num(s.figure,2)+" against "+h6Num(s.allowance,2)) : "summer not applicable")+".";
+  } else F["chart_note_glazing"]="Chart not produced — "+((GC&&GC.blocked)||"the glazing figures are incomplete.");
+  if(WC && !WC.blocked && WC.report){
+    const R=WC.report;
+    F["chart_note_woh"]="Computed for "+site+" — "+R.floorArea+" m², "+(R.state||"—")
+      +" climate zone "+(R.zone||"—")+(R.pv? ", with on-site PV" : ", no on-site PV")
+      +". Units are NCC Whole-of-Home units per Clause 13.6.2; lower is better.";
+  } else F["chart_note_woh"]="Chart not produced — "+((WC&&WC.blocked)||"the Whole-of-Home figures are incomplete.");
+
   return {map:F, lists:L, gaps:gaps};
 }
 
@@ -3239,7 +3317,14 @@ async function generateH6Report(){
   catch(e){ return alert("Couldn't assemble the report data:\n\n"+e.message); }
   try{
     const bytes=await tplBytes("h6report");
-    const {blob,missing}=await fillDocx(bytes, f.map, f.lists);
+    /* Rasterised here rather than read off the page: the charts must go
+       into the report whether or not their sections happen to be open,
+       or which chart you get would depend on where you were standing. */
+    const images={};
+    for(const k of ["glazing","woh"]){
+      try{ const png=await chartPNG(k,2); if(png) images["chart_"+k]=png; }catch(e){}
+    }
+    const {blob,missing,charts}=await fillDocx(bytes, f.map, f.lists, images);
     const job=getV("G0")||(p&&p.job)||"project";
     const a=document.createElement("a"); a.href=URL.createObjectURL(blob);
     a.download=(job+"_PartH6_DtS_Preliminary_DRAFT").replace(/[^\w.-]+/g,"-")+".docx";
@@ -3247,6 +3332,16 @@ async function generateH6Report(){
     setTimeout(()=>URL.revokeObjectURL(a.href),3000);
 
     const lines=[];
+    /* Silence here would mean an issued report still showing the template's
+       example charts, which is the one failure nobody would catch by eye. */
+    const wantCharts=["glazing","woh"].filter(k=>images["chart_"+k]);
+    const gotCharts=charts||[];
+    const noChart=["glazing","woh"].filter(k=>gotCharts.indexOf(k)<0);
+    if(noChart.length) lines.push("Charts NOT replaced — the report still shows the template's "
+      +"example picture for:\n  · "+noChart.join("\n  · ")
+      +"\n\nEither the figures are incomplete, or the picture in your template is not "
+      +"named. Name it in Word: click the chart → Picture Format → Alt Text → and set the "
+      +"picture name to chart_glazing or chart_woh.");
     if(f.gaps.length) lines.push("Left as the template wrote them — no value in the tool yet:\n  · "
       +f.gaps.join("\n  · "));
     if(missing.length) lines.push("Placeholders in your template I don't have a field for:\n  · "
@@ -4146,7 +4241,8 @@ CALC.calc_gzOptimise = function(){
 };
 
 /* ---------------- charts + shared-data panel injected into section 6 ---------------- */
-function drawGzBar(cv,title,items){
+function drawGzBar(){ /* retired — see chartSVG() */ return;
+  /* eslint-disable */ const cv=null, title="", items=[];
   if(!cv) return; const ctx=cv.getContext("2d"); ctx.clearRect(0,0,cv.width,cv.height);
   ctx.fillStyle="#1f2937"; ctx.font="bold 13px Segoe UI"; ctx.fillText(title,14,22);
   if(!items.length){ ctx.fillStyle="#6b7280"; ctx.font="12px Segoe UI"; ctx.fillText("not required in this climate zone",14,60); return; }
@@ -4185,18 +4281,417 @@ function gzSharedPanel(){
   add("ok","Retired to avoid double-up: old GL10 frame-SA band → per-window Frame colour; old GL12 vent % → Openability column + GZ4 Air movement.");
   return '<div style="border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin:10px 0;background:#f8fafc"><b style="font-size:11px;text-transform:uppercase;color:#6b7280">Shared data cross-checks</b>'+rows.join("")+'</div>';
 }
-function injectGzExtras(){
-  const body=document.querySelector("#sec-GZ .sec-body"); if(!body) return;
-  const d=document.createElement("div"); d.id="gzExtras";
-  d.innerHTML=gzSharedPanel()
-    +'<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:8px">'
-    +'<canvas id="gzChS" width="560" height="290" style="background:#fff;border:1px solid var(--line);border-radius:8px;max-width:100%"></canvas>'
-    +'<canvas id="gzChW" width="560" height="290" style="background:#fff;border:1px solid var(--line);border-radius:8px;max-width:100%"></canvas></div>';
-  body.appendChild(d);
-  drawGzCharts();
+
+/* ==========================================================================
+   wohReport() — the structured 13.6.2 result.
+
+   calc_WOH returns a display string and a prose note; everything downstream
+   (the chart, the report generator) was left parsing that prose. This returns
+   the figures themselves, recomputed from S.vals on every call so there is no
+   stored Whole-of-Home outcome that can go stale against an edited input.
+
+   Deliberately mirrors gzReport(): applicable / blocked / figure / allowance /
+   headroom / pct / pass, so both charts can be drawn by the same code.
+   ========================================================================== */
+function wohReport(){
+  if(typeof isNA==="function" && isNA("WH"))
+    return {applicable:false, reason:(typeof naReason==="function" && naReason("WH")) || "marked not applicable"};
+
+  const a=Number(getV("G10"));
+  if(!a) return {applicable:true, blocked:"No conditioned floor area (G10) — enter it on the Shared Data page."};
+
+  const eeR=CALC.calc_EE(), efR=CALC.calc_EF();
+  const EE=Number(getV("C_WH_EE"))||Number(eeR.v)||0;
+  const EF=Number(getV("C_WH_EF"))||Number(efR.v)||0;
+  if(!EE||!EF) return {applicable:true, blocked:
+    (!EE? ("EE not resolved. "+String(eeR.note||"").split("\n")[0]+" ") : "")
+    +(!EF? ("EF not resolved. "+String(efR.note||"").split("\n")[0]) : "")};
+
+  const fA=T_1362a(a), A=a*fA;
+  const epR=CALC.calc_EP(), esR=CALC.calc_ES();
+  /* A pool or spa marked "present" with no volume yet returns an error, not a
+     zero. Charting it as zero would understate the usage and could show a
+     PASS that the finished project does not have. */
+  if(epR.cls==="err") return {applicable:true, blocked:"Pool energy (EP) not resolved — "+epR.note};
+  if(esR.cls==="err") return {applicable:true, blocked:"Spa energy (ES) not resolved — "+esR.note};
+  const EP=Number(epR.v)||0, ES=Number(esR.v)||0;
+  const ER=(getV("WH8a")==="installed"? Number(getV("WH8")) : 0)||0;
+
+  const usage=A*EE+EP+ES-ER, allow=A*EF;
+  const r3=x=>Math.round(x*1000)/1000, r2=x=>Math.round(x*100)/100;
+  return {
+    applicable:true, blocked:null,
+    floorArea:a, areaFactor:fA, A:r3(A), EE:EE, EF:EF, EP:r2(EP), ES:r2(ES), ER:r2(ER),
+    conditioning:r2(A*EE),
+    figure:r2(usage), allowance:r2(allow),
+    headroom:r2(allow-usage),
+    pct: allow>0? Math.round((1-usage/allow)*1000)/10 : null,
+    pass: usage<=allow,
+    complies: usage<=allow,
+    pv: ER>0,
+    state:getV("G2")||"", zone:String(getV("G3")||""),
+    heater:getV("H6H")||"", cooler:getV("H6C")||"", water:getV("H6W")||""
+  };
 }
-const __origRender = render;
-render = function(){ __origRender(); injectGzExtras(); };
+
+/* ==========================================================================
+   Report-grade charts.
+
+   SVG rather than canvas: the same markup is sharp on a phone, on a 4K
+   monitor, and rasterised at 2x into a Word document. Canvas gives you one
+   resolution and you find out which one when the report is printed.
+
+   Every chart answers the same question in the same shape — what is permitted,
+   what is specified, and how much room is left — so both provisions get one
+   renderer and the reader learns to read it once.
+   ========================================================================== */
+const CH = {
+  ink:"#2b2b2b", muted:"#8a8a8a", faint:"#9a9a9a", grid:"#ececec", axis:"#cfcfcf",
+  allow:"#c3d4d3",          /* the allowance: present but receding */
+  spec:"#6b3410",           /* the specified figure: the thing being asserted */
+  specFail:"#a11c1c",
+  good:"#2e7d32", bad:"#b3261e", rule:"#c0392b",
+  font:"'Segoe UI',-apple-system,'Helvetica Neue',Arial,sans-serif"
+};
+
+function chEsc(s){ return String(s==null?"":s)
+  .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+
+/* Round the axis to something a reader can count in. A 6.83 maximum wants
+   ticks at 0,2,4,6,8 — not at 1.366.
+
+   The scale carries a floor as well as a top because 13.6.2 net usage can be
+   NEGATIVE: E_R is the installed PV capacity in kW, straight off the roof
+   plan, subtracted from a figure normalised per 100 m². A 5 kW array on a
+   186 m² dwelling therefore takes net usage below zero, and the NCC means it
+   to. Clamping that at zero would draw a bar sitting exactly on the axis and
+   quietly turn "generates more than it uses" into "uses nothing". */
+function chScale(lo,hi){
+  hi = hi>0? hi*1.28 : 0;      /* headroom above the tallest bar for its label */
+  lo = lo<0? lo*1.10 : 0;
+  const span=(hi-lo)||1;
+  const mag=Math.pow(10,Math.floor(Math.log(span)/Math.LN10));
+  /* Take the SMALLEST round step that still fits in about seven gridlines,
+     rather than deriving one from span/5 and accepting whatever it gives. The
+     derived version rounded a 6.1-unit span up to a step of 2 and drew an axis
+     running to -4 for a bar reaching -2.22 — two thirds of the chart empty. */
+  const cands=[0.05,0.1,0.2,0.25,0.5,1,2,2.5,5,10].map(m=>m*mag);
+  let step=cands[cands.length-1];
+  for(const c of cands){
+    if(Math.ceil(hi/c-1e-9)-Math.floor(lo/c+1e-9) <= 7){ step=c; break; }
+  }
+  const top=Math.ceil(hi/step-1e-9)*step, bot=Math.floor(lo/step+1e-9)*step;
+  const vals=[]; for(let v=bot; v<=top+step*1e-6; v+=step) vals.push(Math.round(v*1e6)/1e6);
+  return {step:step, vals:vals, top:top, bot:bot};
+}
+
+/* Trailing zeros are only ever noise AFTER a decimal point. Stripping them
+   unconditionally turned the axis labels 10 and 20 into 1 and 2 — an axis that
+   is wrong by a factor of ten and looks perfectly plausible. */
+function chNum(v,dp){ const n=Number(v); if(!isFinite(n)) return "—";
+  let s=n.toFixed(dp==null?2:dp);
+  if(s.indexOf(".")>=0) s=s.replace(/0+$/,"").replace(/\.$/,"");
+  return s; }
+
+/* --------------------------------------------------------------------------
+   chartSVG(o) -> {svg, w, h}
+
+   o = { w,h, title, ylab, foot, legend:[{c,l}], dp,
+         groups:[{ label:[lines], bars:[{v,kind,dp}], note:{text,ok,arrow} }],
+         rule:{v,label} }
+   -------------------------------------------------------------------------- */
+function chartSVG(o){
+  const W=o.w||880, H=o.h||470;
+  const mL=88, mR=26, mT=o.legend? 44 : 40, mB=(o.foot?34:10)+22*Math.max.apply(null,
+        o.groups.map(g=>(g.label||[]).length).concat([1]))+18;
+  const pw=W-mL-mR, ph=H-mT-mB;
+  const vals=[]; o.groups.forEach(g=>g.bars.forEach(b=>vals.push(b.v)));
+  if(o.rule) vals.push(o.rule.v);
+  const T=chScale(Math.min.apply(null, vals.concat([0])),
+                  Math.max.apply(null, vals.concat([0])));
+  const y=v=>mT+ph-((v-T.bot)/(T.top-T.bot))*ph;
+  const y0=y(0);
+  const barTop=v=>Math.min(y(v), y0);
+  const dp=o.dp==null?2:o.dp;
+  let s="";
+
+  /* frame */
+  s+='<rect x="0" y="0" width="'+W+'" height="'+H+'" fill="#ffffff"/>';
+  s+='<text x="18" y="26" font-size="17" font-weight="700" fill="'+CH.ink+'">'+chEsc(o.title)+'</text>';
+
+  /* gridlines and the value axis */
+  T.vals.forEach(v=>{
+    s+='<line x1="'+mL+'" y1="'+y(v)+'" x2="'+(W-mR)+'" y2="'+y(v)+'" stroke="'
+      +(v===0?CH.axis:CH.grid)+'" stroke-width="1"/>';
+    s+='<text x="'+(mL-10)+'" y="'+(y(v)+4)+'" text-anchor="end" font-size="12" fill="'+CH.muted+'">'
+      +chNum(v, T.step<1?1:0)+'</text>';
+  });
+  if(o.ylab) s+='<text transform="translate(20,'+(mT+ph/2)+') rotate(-90)" text-anchor="middle" '
+    +'font-size="12.5" fill="'+CH.ink+'">'+chEsc(o.ylab)+'</text>';
+
+  /* bars */
+  const gw=pw/o.groups.length;
+  o.groups.forEach((g,gi)=>{
+    const cx=mL+gw*(gi+0.5);
+    const n=g.bars.length;
+    const bw=Math.min(118, (gw-46)/n);
+    const span=bw*n+(n-1)*6;
+    g.bars.forEach((b,bi)=>{
+      const x=cx-span/2+bi*(bw+6);
+      const yy=barTop(b.v), h=Math.abs(y(b.v)-y0);
+      const col=b.kind==="allow"? CH.allow : (b.fail? CH.specFail : CH.spec);
+      s+='<rect x="'+x+'" y="'+yy+'" width="'+bw+'" height="'+h+'" fill="'+col+'"/>';
+      /* a negative bar hangs below the axis, so its label goes below it too */
+      const ly=(b.v<0)? (y(b.v)+18) : (yy-8);
+      s+='<text x="'+(x+bw/2)+'" y="'+ly+'" text-anchor="middle" font-size="13" '
+        +'font-weight="'+(b.kind==="allow"?"400":"700")+'" '
+        +'fill="'+(b.kind==="allow"?CH.muted:col)+'">'+chNum(b.v, b.dp==null?dp:b.dp)+'</text>';
+    });
+    /* category label, one line per entry so a long label never overlaps */
+    (g.label||[]).forEach((ln,li)=>{
+      s+='<text x="'+cx+'" y="'+(mT+ph+26+li*20)+'" text-anchor="middle" font-size="14" '
+        +'fill="'+CH.ink+'">'+chEsc(ln)+'</text>';
+    });
+    /* the headroom note — the number the reader actually came for */
+    if(g.note){
+      const col=g.note.ok===false? CH.bad : CH.good;
+      const lines=String(g.note.text).split("\n");
+      const topBar=Math.min.apply(null, g.bars.map(b=>barTop(b.v)));
+      let ny=topBar-34-(lines.length-1)*16;
+      if(g.note.arrow) ny-=26;
+      if(ny<mT+12) ny=mT+12;
+      lines.forEach((ln,li)=>{
+        s+='<text x="'+cx+'" y="'+(ny+li*16)+'" text-anchor="middle" font-size="13" '
+          +'font-weight="700" fill="'+col+'">'+chEsc(ln)+'</text>';
+      });
+      if(g.note.arrow){
+        /* stop clear of the bar's own value label, or a tight headroom draws
+           the arrowhead straight through the number it is pointing at */
+        const ay=ny+(lines.length-1)*16+8, tgt=barTop(g.bars[g.bars.length-1].v)-26;
+        if(tgt>ay+16){
+          s+='<line x1="'+cx+'" y1="'+ay+'" x2="'+cx+'" y2="'+(tgt-7)+'" stroke="'+col+'" stroke-width="1.6"/>';
+          s+='<path d="M'+(cx-5)+','+(tgt-8)+' L'+cx+','+tgt+' L'+(cx+5)+','+(tgt-8)+'Z" fill="'+col+'"/>';
+        }
+      }
+    }
+  });
+
+  /* the zero line, drawn last so a negative bar cannot hide it */
+  if(T.bot<0) s+='<line x1="'+mL+'" y1="'+y0+'" x2="'+(W-mR)+'" y2="'+y0
+    +'" stroke="'+CH.muted+'" stroke-width="1"/>';
+
+  /* the allowance rule, for a chart whose two bars are not side by side */
+  if(o.rule){
+    s+='<line x1="'+mL+'" y1="'+y(o.rule.v)+'" x2="'+(W-mR)+'" y2="'+y(o.rule.v)+'" stroke="'
+      +CH.rule+'" stroke-width="1.6" stroke-dasharray="7,5"/>';
+  }
+
+  /* legend */
+  if(o.legend){
+    const lx=W-mR; let ly=mT+16;
+    o.legend.forEach(it=>{
+      const tw=it.l.length*6.6;
+      s+='<text x="'+lx+'" y="'+(ly+4)+'" text-anchor="end" font-size="12.5" fill="'+CH.ink+'">'
+        +chEsc(it.l)+'</text>';
+      s+='<rect x="'+(lx-tw-26)+'" y="'+(ly-6)+'" width="18" height="11" fill="'+it.c+'"/>';
+      ly+=19;
+    });
+  }
+
+  if(o.foot) s+='<text x="18" y="'+(H-10)+'" font-size="12" fill="'+CH.faint+'">'+chEsc(o.foot)+'</text>';
+
+  const svg='<svg xmlns="http://www.w3.org/2000/svg" width="'+W+'" height="'+H+'" viewBox="0 0 '+W+' '+H
+    +'" font-family="'+CH.font+'">'+s+'</svg>';
+  return {svg:svg, w:W, h:H};
+}
+
+/* --------------------------------------------------------------------------
+   The two chart specifications. Both read a *Report() and nothing else, so a
+   chart can never disagree with the report it sits next to.
+   -------------------------------------------------------------------------- */
+function gzChartSpec(){
+  const G=(typeof gzReport==="function") ? gzReport() : null;
+  if(!G || !G.applicable) return {blocked:(G&&G.reason)||"13.3 is marked not applicable."};
+  if(G.blocked) return {blocked:G.blocked};
+  if(!G.winter && !G.summer) return {blocked:"Neither test applies in this climate zone."};
+  if(G.proposedEntered===false || (G.specified===0))
+    return {blocked:"No glazing specified yet — run the optimiser for the required specification, "
+                   +"then enter the windows you propose."};
+  const groups=[];
+  const put=(r,lines)=>{ if(!r) return;
+    groups.push({label:lines,
+      bars:[{v:r.allowance,kind:"allow"},{v:r.figure,kind:"spec",fail:!r.pass}],
+      note:{ok:r.pass, text:(r.pass? Math.abs(r.pct)+"% below limit"
+                                   : Math.abs(r.pct)+"% OVER limit")}});
+  };
+  put(G.winter,["Winter conductance","(heat loss)"]);
+  put(G.summer,["Summer solar heat gain"]);
+  return {blocked:null, complies:G.complies, report:G, spec:{
+    w:880, h:470,
+    title:"External Glazing — specified vs maximum permitted (Part 13.3)",
+    ylab:"Aggregate value  (NCC Glazing Calculator units)",
+    foot:"Lower is better. Bars at or below the allowance comply; the gap is the compliance headroom.",
+    legend:[{c:CH.allow,l:"Maximum permitted (allowance)"},{c:CH.spec,l:"Specified (achieved)"}],
+    groups:groups}};
+}
+
+function wohChartSpec(){
+  const R=(typeof wohReport==="function") ? wohReport() : null;
+  if(!R || !R.applicable) return {blocked:(R&&R.reason)||"13.6 is marked not applicable."};
+  if(R.blocked) return {blocked:R.blocked};
+  return {blocked:null, complies:R.complies, report:R, spec:{
+    w:880, h:560, dp:2,
+    title:"Whole-of-Home — specified vs maximum permitted (Part 13.6.2)",
+    ylab:"Net equivalent energy usage  (NCC WoH units)",
+    foot:"Lower is better. Net usage at or below the allowance complies; on-site PV (E_R) reduces net usage.",
+    rule:{v:R.allowance},
+    groups:[
+      {label:["Maximum permitted","(allowance = A × E_F)"], bars:[{v:R.allowance,kind:"allow"}]},
+      {label:["Specified","(net equivalent","energy usage)"],
+       bars:[{v:R.figure,kind:"spec",fail:!R.pass}],
+       /* "177% below the maximum permitted" is arithmetically true and reads
+          like a typo. Once PV has taken net usage past zero the useful thing
+          to say is that it has. */
+       note:{ok:R.pass, arrow:true,
+             text:(!R.pass ? Math.abs(R.pct)+"% OVER the\nmaximum permitted"
+                 : R.figure<0 ? "net usage is negative —\nthe "+chNum(R.ER,1)
+                                +" kW array exceeds\nthe assessed usage"
+                 : Math.abs(R.pct)+"% below the\nmaximum permitted")}}
+    ]}};
+}
+
+const CHART_SPECS = {glazing:gzChartSpec, woh:wohChartSpec};
+
+/* --------------------------------------------------------------------------
+   Rasterising. Word cannot be handed an SVG without a PNG beside it, and a
+   chart pasted at screen resolution looks like a screenshot — so everything
+   leaves here at 2x.
+
+   Returns null rather than throwing where there is no canvas (the test
+   harness, an old browser): a missing chart must never stop a report.
+   -------------------------------------------------------------------------- */
+function chartRaster(svg, w, h, scale){
+  scale=scale||2;
+  return new Promise(resolve=>{
+    try{
+      const cv=document.createElement("canvas");
+      cv.width=Math.round(w*scale); cv.height=Math.round(h*scale);
+      const ctx=cv.getContext("2d");
+      if(!ctx) return resolve(null);
+      const img=new Image();
+      img.onload=()=>{ try{
+        ctx.fillStyle="#ffffff"; ctx.fillRect(0,0,cv.width,cv.height);
+        ctx.drawImage(img,0,0,cv.width,cv.height);
+        resolve({dataURL:cv.toDataURL("image/png"), w:cv.width, h:cv.height});
+      }catch(e){ resolve(null); } };
+      img.onerror=()=>resolve(null);
+      img.src="data:image/svg+xml;charset=utf-8,"+encodeURIComponent(svg);
+    }catch(e){ resolve(null); }
+  });
+}
+
+async function chartPNG(key, scale){
+  const f=CHART_SPECS[key]; if(!f) return null;
+  const c=f(); if(c.blocked) return null;
+  return await chartRaster(chartSVG(c.spec).svg, c.spec.w, c.spec.h, scale);
+}
+
+async function chartDownload(key){
+  const png=await chartPNG(key,2);
+  if(!png) return alert("That chart can't be produced yet — the figures behind it aren't complete.");
+  const job=(getV("G0")||"project").toString().replace(/[^\w.-]+/g,"-");
+  const a=document.createElement("a"); a.href=png.dataURL;
+  a.download=job+"_"+(key==="woh"?"WholeOfHome":"Glazing")+"_chart.png";
+  document.body.appendChild(a); a.click(); a.remove();
+}
+
+async function chartCopy(key, btn){
+  const say=m=>{ if(btn){ const o=btn.textContent; btn.textContent=m;
+                          setTimeout(()=>{btn.textContent=o;},1800); } };
+  const png=await chartPNG(key,2);
+  if(!png) return alert("That chart can't be produced yet — the figures behind it aren't complete.");
+  try{
+    const blob=await (await fetch(png.dataURL)).blob();
+    await navigator.clipboard.write([new ClipboardItem({"image/png":blob})]);
+    say("copied ✓");
+  }catch(e){
+    /* Safari and Firefox refuse image writes outside a user gesture, and some
+       browsers have no ClipboardItem at all — say what to do instead of
+       failing silently. */
+    say("use Download");
+    alert("This browser won't let a page put an image on the clipboard.\n\n"
+         +"Use “Download PNG” and drag the file into your report, or right-click the "
+         +"chart and choose Copy Image.");
+  }
+}
+
+/* --------------------------------------------------------------------------
+   On-page rendering. A blocked chart states what is missing — an empty frame,
+   or worse a zero bar, would read as an assessed result.
+   -------------------------------------------------------------------------- */
+function chartBlockHTML(key){
+  const c=CHART_SPECS[key]();
+  if(c.blocked)
+    return '<div class="chart-wrap" data-chart="'+key+'">'
+      +'<div class="chart-blocked"><b>Chart not yet available.</b> '+chEsc(c.blocked)+'</div></div>';
+  const v=chartSVG(c.spec);
+  return '<div class="chart-wrap" data-chart="'+key+'">'
+    +'<div class="chart-svg">'+v.svg+'</div>'
+    +'<div class="chart-bar">'
+    +'<span class="chart-verdict '+(c.complies?"ok":"no")+'">'
+      +(c.complies?"Complies":"Does not yet comply")+'</span>'
+    +'<span style="flex:1"></span>'
+    +'<button class="cbtn" onclick="chartDownload(\''+key+'\')">Download PNG</button>'
+    +'<button class="cbtn" onclick="chartCopy(\''+key+'\',this)">Copy image</button>'
+    +'</div>'
+    +'<div class="chart-note">Drawn from the same figures as the report — it cannot disagree with them. '
+    +'The report generator embeds this chart automatically.</div></div>';
+}
+
+const CHART_CSS = '<style id="chartCSS">'
+ +'.chart-wrap{border:1px solid var(--line);border-radius:8px;background:#fff;padding:10px 12px;margin:12px 0}'
+ +'.chart-svg svg{width:100%;height:auto;display:block}'
+ +'.chart-bar{display:flex;align-items:center;gap:8px;margin-top:8px;flex-wrap:wrap}'
+ +'.chart-verdict{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;'
+   +'padding:3px 8px;border-radius:4px}'
+ +'.chart-verdict.ok{background:#e8f3e9;color:#2e7d32}'
+ +'.chart-verdict.no{background:#fdeaea;color:#b3261e}'
+ +'.chart-note{font-size:11px;color:var(--muted);margin-top:6px}'
+ +'.chart-blocked{font-size:12.5px;color:#8a6d3b;background:#fdf7e7;border:1px solid #f0e2bc;'
+   +'border-radius:6px;padding:10px 12px}'
+ +'</style>';
+
+/* --------------------------------------------------------------------------
+   Injection. This runs off p13Render — NOT off `render`, which in the merged
+   suite is the tracker's. That is why the glazing charts written in round 10
+   never once appeared on screen.
+   -------------------------------------------------------------------------- */
+function injectSecCharts(){
+  if(!document.getElementById("chartCSS"))
+    document.head.insertAdjacentHTML("beforeend", CHART_CSS);
+  const at={GZ:"glazing", WH:"woh"};
+  for(const secId of Object.keys(at)){
+    const body=document.querySelector("#sec-"+secId+" .sec-body");
+    if(!body) continue;                              /* section not on this page */
+    const old=body.querySelector('[data-chart-host="'+secId+'"]');
+    if(old) old.remove();
+    const d=document.createElement("div");
+    d.setAttribute("data-chart-host", secId);
+    d.innerHTML=(secId==="GZ" && typeof gzSharedPanel==="function" ? gzSharedPanel() : "")
+               + chartBlockHTML(at[secId]);
+    body.appendChild(d);
+  }
+}
+/* Kept as a name because round 10 wired setTimeout(drawGzCharts,50) into four
+   calc functions; it now redraws the real charts. */
+function drawGzCharts(){ try{ injectSecCharts(); }catch(e){} }
+function injectGzExtras(){ injectSecCharts(); }
+/* THE BUG THIS ROUND EXISTS TO FIX. In the merged suite `render` is the
+   TRACKER's render — the data tool's is p13Render — so decorating `render`
+   put the glazing charts on a function that never draws a compliance
+   section. #gzExtras was never created on any page, on any project. */
+const __origP13Render = p13Render;
+p13Render = function(){ __origP13Render.apply(this, arguments); injectSecCharts(); };
 p13Render();
 
 /* One notes field per section, added here rather than written into each
@@ -4217,7 +4712,7 @@ p13Render();
 <script>
 /* ==================== SUITE SHELL ==================== */
 /* build stamp — compare this between devices before blaming the sync */
-const SUITE_BUILD = "2026-08-03 17:02";
+const SUITE_BUILD = "2026-08-04 15:24";
 const SUITE_BUILD_NOTE = " · build " + SUITE_BUILD;
 /* ============================================================================
    SUITE SHELL — owns the store, the project selector, the two-level nav, and
